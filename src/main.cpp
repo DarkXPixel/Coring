@@ -23,7 +23,7 @@ int main() {
     Coring::accept_loop(&ring, *server_fd_opt);
 
     while(true) {
-        io_uring_cqe* cqe = nullptr;
+        io_uring_cqe* cqe = nullptr; //test
         int ret = io_uring_wait_cqe(&ring, &cqe);
         if(ret < 0) {
             std::println(stderr, "io_uring_wait_cqe failed: {}", ret);
