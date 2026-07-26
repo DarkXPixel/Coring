@@ -2,10 +2,19 @@
 #include "../include/Task.hpp"
 #include <print>
 #include <iostream>
+#include <sched.h>
 
 int main() {
     constexpr int16_t PORT = 8080;
     constexpr uint32_t QUEUE_DEPTH = 256;
+
+
+    // cpu_set_t cpuset;
+    // CPU_ZERO(&cpuset);
+    // CPU_SET(core_id, cpusetp)
+
+    //io_uring_params;
+    //io_uring_queue_init_params(unsigned int entries, struct io_uring *ring, struct io_uring_params *p)
 
     io_uring ring;
     if(io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
@@ -34,21 +43,7 @@ int main() {
             ctx->resume(cqe->res);
         }
         io_uring_cqe_seen(&ring, cqe);
-        // io_uring_submit_and_wait(&ring, 1);
-
-        // io_uring_cqe* cqe;
-        // uint32_t head;
-        // uint32_t count = 0;
-
-        // io_uring_for_each_cqe(&ring, head, cqe) {
-        //     count++;
-
-        //     auto* awaiter = static_cast<Coring::IOAwaiter*>(io_uring_cqe_get_data(cqe));
-        //     if(awaiter) {
-        //         awaiter->resume_coroutine(cqe->res);
-        //     }
-        // }
-        // io_uring_cq_advance(&ring, count);
+      
     }
 
     close(*server_fd_opt);
