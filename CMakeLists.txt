@@ -16,3 +16,5 @@ add_executable(exe src/main.cpp)
 target_include_directories(exe PRIVATE ${LIBURING_INCLUDE_DIRS})
 target_link_directories(exe PRIVATE ${LIBURING_LIBRARY_DIRS})
 target_link_libraries(exe PRIVATE ${LIBURING_LIBRARIES})
+
+target_include_directories(exe PRIVATE include)

@@ -10,6 +10,7 @@
 #include <print>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <ctime>
 #include "HttpRequest.hpp"
 
 namespace Coring {
@@ -48,8 +49,10 @@ namespace Coring {
         void* buf{nullptr};
         uint32_t len{0};
         socklen_t* addrlen{nullptr};
+        int timeout_sec{0};
 
         IOContext ctx;
+        __kernel_timespec ts{};
 
         bool await_ready() const noexcept {return false;}
 
@@ -65,8 +68,18 @@ namespace Coring {
                 io_uring_prep_accept(sqe, fd, static_cast<sockaddr*>(buf), addrlen, 0);
             }
 
-            io_uring_sqe_set_data(sqe, &ctx);
+            if(timeout_sec > 0) {
+                sqe->flags |= IOSQE_IO_LINK;
+                io_uring_sqe_set_data(sqe, &ctx);
 
+                io_uring_sqe* timeout_sqe = io_uring_get_sqe(ring);
+                ts.tv_sec = timeout_sec;
+                ts.tv_nsec = 0;
+                io_uring_prep_link_timeout(timeout_sqe, &ts, 0);
+                io_uring_sqe_set_data(timeout_sqe, nullptr);
+            } else {
+                io_uring_sqe_set_data(sqe, &ctx);
+            }
             io_uring_submit(ring);
         }
 
@@ -76,109 +89,132 @@ namespace Coring {
     };
 
     inline Task handle_client(io_uring* ring, int client_fd) {
+        constexpr int KEEP_ALIVE_TIMEOUT_SEC = 5;
         char buf[1024];
         std::string raw_buffer;
+        while(true)
+        {
+            bool keep_alive = true;
 
-        size_t header_end_pos = std::string::npos;
+            size_t header_end_pos = std::string::npos;
 
-        while(true) {
-            IOAwaiter read_op{
-                .ring = ring,
-                .op_type = IORING_OP_READ,
-                .fd = client_fd,
-                .buf = buf,
-                .len = sizeof(buf)
-            };
-
-            int bytes_read = co_await read_op;
-
-            if(bytes_read <= 0) {
-                close(client_fd);
-                co_return;
-            }
-
-            raw_buffer.append(buf, bytes_read);
-            if(raw_buffer.size() > 8 * 1024) {
-                auto strerror413 = get_http_413_response();
-                IOAwaiter write_op{
+            while(header_end_pos == std::string::npos) {
+                IOAwaiter read_op{
                     .ring = ring,
-                    .op_type = IORING_OP_WRITE,
+                    .op_type = IORING_OP_READ,
                     .fd = client_fd,
-                    .buf = strerror413.data(),
-                    .len = static_cast<uint32_t>(strerror413.size())
+                    .buf = buf,
+                    .len = sizeof(buf),
+                    .timeout_sec = 0
                 };
-                co_await write_op;
-                close(client_fd);
-                co_return;
+
+                int bytes_read = co_await read_op;
+
+                if(bytes_read <= 0) {
+                    close(client_fd);
+                    co_return;
+                }
+
+                raw_buffer.append(buf, bytes_read);
+                // if(raw_buffer.size() > 8 * 1024) {
+                //     auto strerror413 = get_http_413_response();
+                //     IOAwaiter write_op{
+                //         .ring = ring,
+                //         .op_type = IORING_OP_WRITE,
+                //         .fd = client_fd,
+                //         .buf = strerror413.data(),
+                //         .len = static_cast<uint32_t>(strerror413.size()),
+                //     };
+                //     co_await write_op;
+                //     close(client_fd);
+                //     co_return;
+                // }
+
+                header_end_pos = raw_buffer.find("\r\n\r\n");
+                if(header_end_pos != std::string::npos) {
+                    break;
+                }
             }
 
-            header_end_pos = raw_buffer.find("\r\n\r\n");
-            if(header_end_pos != std::string::npos) {
-                break;
+            std::string_view raw_headers(raw_buffer.data(), header_end_pos);
+            HttpRequest request = parse_http_headers(raw_headers);
+
+            auto conn_it = request.headers.find("connection");
+            if(conn_it != request.headers.end() && conn_it->second == "close") {
+                keep_alive = false;
             }
-        }
 
-        std::string_view raw_headers(raw_buffer.data(), header_end_pos);
-        HttpRequest request = parse_http_headers(raw_headers);
+            size_t body_start_pos = header_end_pos + 4;
 
-        size_t body_start_pos = header_end_pos + 4;
+            size_t content_lenght = 0;
+            auto it = request.headers.find("content-lenght");
+            if(it != request.headers.end()) {
+                content_lenght = std::stoull(it->second);
+            }
 
-        size_t content_lenght = 0;
-        auto it = request.headers.find("content-lenght");
-        if(it != request.headers.end()) {
-            content_lenght = std::stoull(it->second);
-        }
+            size_t bytes_already_read = raw_buffer.size() - body_start_pos;
 
-        size_t bytes_already_read = raw_buffer.size() - body_start_pos;
+            request.body.reserve(content_lenght);
+            if(bytes_already_read > 0) {
+                request.body.append(raw_buffer.data() + body_start_pos, std::min(bytes_already_read, content_lenght));
+            }
 
-        request.body.reserve(content_lenght);
-        if(bytes_already_read > 0) {
-            request.body.append(raw_buffer.data() + body_start_pos, std::min(bytes_already_read, content_lenght));
-        }
+            while(request.body.size() < content_lenght) {
+                size_t bytes_needed = content_lenght - request.body.size();
+                size_t read_size = std::min(sizeof(buf), bytes_needed);
+                IOAwaiter read_op{
+                    .ring = ring,
+                    .op_type = IORING_OP_READ,
+                    .fd = client_fd,
+                    .buf = buf,
+                    .len = static_cast<uint32_t>(read_size),
+                    .timeout_sec = 0
+                };
+                int bytes_read = co_await read_op;
+                if(bytes_read <= 0) {
+                    break;
+                }
+                request.body.append(buf, bytes_read);
+            }
 
-        while(request.body.size() < content_lenght) {
-            size_t bytes_needed = content_lenght - request.body.size();
-            size_t read_size = std::min(sizeof(buf), bytes_needed);
-            IOAwaiter read_op{
+            size_t total_processed_bytes = body_start_pos + content_lenght;
+            if(raw_buffer.size() > total_processed_bytes) {
+                raw_buffer.erase(0, total_processed_bytes);
+            } else {
+                raw_buffer.clear();
+            }
+
+            std::println("[+] Recieved HTTP Request:");
+            std::println("    Method: {}", request.method);
+            std::println("    Path: {}", request.path);
+            std::println("    Body lenght: {} bytes", request.body.size());
+            if(!request.body.empty() && request.body.size() < 200) {
+                std::println("    Body content: {}", request.body);
+            }
+
+            std::string response = std::format(
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: 13\r\n"
+                "Connection: {}\r\n"
+                "\r\n"
+                "Hello World!",
+                keep_alive ? "keep-alive" : "close");
+
+            
+            IOAwaiter write_op{
                 .ring = ring,
-                .op_type = IORING_OP_READ,
+                .op_type = IORING_OP_WRITE,
                 .fd = client_fd,
-                .buf = buf,
-                .len = static_cast<uint32_t>(read_size)
+                .buf = response.data(),
+                .len = static_cast<uint32_t>(response.size())
             };
-            int bytes_read = co_await read_op;
-            if(bytes_read <= 0) {
+            int bytes_written = co_await write_op;
+
+            if(bytes_written <= 0 || !keep_alive) {
                 break;
             }
-            request.body.append(buf, bytes_read);
         }
-
-        std::println("[+] Recieved HTTP Request:");
-        std::println("    Method: {}", request.method);
-        std::println("    Path: {}", request.path);
-        std::println("    Body lenght: {} bytes", request.body.size());
-        if(!request.body.empty() && request.body.size() < 200) {
-            std::println("    Body content: {}", request.body);
-        }
-
-        std::string response =
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 13\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Hello World!";
-
-        
-        IOAwaiter write_op{
-            .ring = ring,
-            .op_type = IORING_OP_WRITE,
-            .fd = client_fd,
-            .buf = response.data(),
-            .len = static_cast<uint32_t>(response.size())
-        };
-
-        co_await write_op;
         close(client_fd);
         // char buf[1024];
 
