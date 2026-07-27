@@ -4,7 +4,9 @@
 #include <print>
 #include <iostream>
 #include <sched.h>
+#include <string_view>
 #include <sys/types.h>
+#include "HttpRequest.hpp"
 #include "coring/AcceptorSocket.hpp"
 #include "coring/ClientSocket.hpp"
 #include "coring/IOEngine.hpp"
@@ -14,21 +16,80 @@
 template<Coring::IOEngineConcept Engine>
 Coring::IOTask handle_client(Coring::ClientSocket<Engine> client) {
     char buffer[1024];
+    std::string raw_buffer;
     while(true) {
-        ssize_t bytes_read = co_await client.async_read(buffer, sizeof(buffer));
+        size_t header_end_pos = raw_buffer.find("\r\n\r\n");
 
-        if(bytes_read <= 0) {
-            break;
-        }
-
-        size_t total_written = 0;
-        while(total_written < static_cast<size_t>(bytes_read)) {
-            ssize_t bytes_written = co_await client.async_write(buffer + total_written, bytes_read - total_written);
-            if(bytes_written <= 0) {
-                break;
+        while(header_end_pos == std::string::npos) {
+            auto bytes_read = co_await client.async_read(buffer, sizeof(buffer));
+            if(bytes_read <= 0) {
+                co_return;
             }
-            total_written += bytes_written;
+            raw_buffer.append(buffer, bytes_read);
+            header_end_pos = raw_buffer.find("\r\n\r\n");
         }
+
+        std::string_view raw_headers(raw_buffer.data(), header_end_pos);
+        Coring::HttpRequest request = Coring::parse_http_headers(raw_headers);
+
+        size_t body_start_pos = header_end_pos + 4;
+
+        size_t content_lenght = 0;
+        auto it = request.headers.find("content-length");
+        if(it != request.headers.end()) {
+            content_lenght = std::stoull(it->second);
+        }
+
+        bool keep_alive = true;
+        auto conn_it = request.headers.find("connection");
+        if(conn_it != request.headers.end()) {
+            std::string_view val = conn_it->second;
+            if(val == "close") {
+                keep_alive = false;
+            } else {
+                keep_alive = true;
+            }
+        }
+
+        size_t bytes_already_read = raw_buffer.size() - body_start_pos;
+
+        request.body.reserve(content_lenght);
+        if(bytes_already_read > 0) {
+            request.body.append(raw_buffer.data() + body_start_pos, std::min(bytes_already_read, content_lenght));
+        }
+        while(request.body.size() < content_lenght) {
+                size_t bytes_needed = content_lenght - request.body.size();
+                size_t read_size = std::min(sizeof(buffer), bytes_needed);
+                auto bytes_read = co_await client.async_read(buffer, read_size);
+                if(bytes_read <= 0) {
+                    break;
+                }
+                request.body.append(buffer, bytes_read);
+        }
+
+         size_t total_processed_bytes = body_start_pos + content_lenght;
+            if(raw_buffer.size() > total_processed_bytes) {
+                raw_buffer.erase(0, total_processed_bytes);
+            } else {
+                raw_buffer.clear();
+            }
+
+
+        std::string_view body = "Hello World!";
+        std::string response = std::format(
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain\r\n"
+                "Content-Length: {}\r\n"
+                "Connection: {}\r\n"
+                "{}"
+                "\r\n"
+                "{}", body.size(),keep_alive ? "keep-alive" : "close", keep_alive ? "Keep-Alive: timeout=5, max=1000\r\n" : "", body);
+
+        auto bytes_written = co_await client.async_write(response.data(), response.size());
+        if(!keep_alive) {
+            co_return;
+        }
+        //co_return;
     }
 }
 
@@ -51,50 +112,6 @@ int main() {
     Coring::spawn(accept_loop(std::move(*acceptor), *engine));
 
     engine->run();
-
-    // constexpr int16_t PORT = 8080;
-    // constexpr uint32_t QUEUE_DEPTH = 256;
-
-
-    // // cpu_set_t cpuset;
-    // // CPU_ZERO(&cpuset);
-    // // CPU_SET(core_id, cpusetp)
-
-    // //io_uring_params;
-    // //io_uring_queue_init_params(unsigned int entries, struct io_uring *ring, struct io_uring_params *p)
-
-    // io_uring ring;
-    // if(io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
-    //     std::println(stderr, "Failed to init io_uring");
-    //     return 1;
-    // }
-
-    // auto server_fd_opt = Coring::create_server_socket(PORT);
-    // if(!server_fd_opt.has_value()) {
-    //     std::println(stderr, "Failed to create server socket");
-    //     return 1;
-    // }
-
-    // std::println("Server started on port {}...", PORT);
-    // Coring::accept_loop(&ring, *server_fd_opt);
-
-    // while(true) {
-    //     io_uring_cqe* cqe = nullptr; //test
-    //     int ret = io_uring_wait_cqe(&ring, &cqe);
-    //     if(ret < 0) {
-    //         std::println(stderr, "io_uring_wait_cqe failed: {}", ret);
-    //         break;
-    //     }
-    //     auto* ctx = static_cast<Coring::IOContext*>(io_uring_cqe_get_data(cqe));
-    //     if(ctx) {
-    //         ctx->resume(cqe->res);
-    //     }
-    //     io_uring_cqe_seen(&ring, cqe);
-      
-    // }
-
-    // close(*server_fd_opt);
-    // io_uring_queue_exit(&ring);
 
     return 0;
 }

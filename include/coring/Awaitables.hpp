@@ -1,6 +1,7 @@
 #pragma once
 
 #include "coring/IOEngine.hpp"
+#include <cerrno>
 #include <coroutine>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -32,13 +33,40 @@ namespace Coring {
         size_t len;
         typename Engine::Context_t& ctx;
 
-        bool await_ready() noexcept {return false;}
+        ssize_t bytes_read {-1};
+        int read_errno{0};
+
+        bool await_ready() noexcept {
+            bytes_read = ::read(fd, buf, len);
+            if(bytes_read >= 0) {
+                return 0;
+            }
+
+            read_errno = errno;
+
+            if(read_errno == EAGAIN || read_errno == EWOULDBLOCK) {
+                return false;
+            }
+
+            return true;
+        }
         void await_suspend(std::coroutine_handle<> h) noexcept {
             engine.async_read(fd,  buf,  len,  ctx, h);
         }
 
         ssize_t await_resume() noexcept {
-            return ::read(fd, buf, len);
+            if(bytes_read >= 0) {
+                return bytes_read;
+            }
+            if(read_errno != EAGAIN && read_errno != EWOULDBLOCK) {
+                errno = read_errno;
+            }
+
+            ssize_t res = ::read(fd, buf, len);
+            if(res < 0) {
+                return -1;
+            }
+            return res;
         }
     };
 

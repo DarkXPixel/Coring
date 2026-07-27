@@ -1,5 +1,6 @@
 #pragma once
 
+#include <print>
 #include <unistd.h>
 #include <utility>
 #include "coring/Awaitables.hpp"
@@ -12,10 +13,13 @@ namespace Coring {
         typename Engine::Context_t ctx_{};
 
     public:
-        ClientSocket(int fd, Engine& engine) : fd_(fd), engine_(engine) {}
+        ClientSocket(int fd, Engine& engine) : fd_(fd), engine_(engine) {
+            std::println("[+] New client connected fd: {}", fd_);
+        }
 
         ~ClientSocket() {
             if(fd_ >= 0) {
+                std::println("[-] Client disconnected fd: {}", fd_);
                 engine_.unregister_fd(fd_);
                 ::close(fd_);
                 fd_ = -1;
