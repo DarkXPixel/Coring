@@ -10,6 +10,11 @@ namespace Coring {
     concept IOEngineConcept = requires(Engine engine, int fd, void* buf, size_t len, 
                                    typename Engine::Context_t& ctx, 
                                    std::coroutine_handle<> h) {
+    typename Engine::Context_t;
+    typename Engine::AcceptAwaitable_t;
+    typename Engine::ReadAwaitable_t;
+    typename Engine::WriteAwaitable_t;                            
+
     { engine.async_accept(fd, ctx, h) };
     { engine.async_read(fd, buf, len, ctx, h) };
     { engine.async_write(fd, buf, len, ctx, h) };

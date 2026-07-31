@@ -6,12 +6,15 @@
 #include <sched.h>
 #include <string_view>
 #include <sys/types.h>
+#include <thread>
+#include <vector>
 #include "HttpRequest.hpp"
 #include "coring/AcceptorSocket.hpp"
 #include "coring/ClientSocket.hpp"
 #include "coring/IOEngine.hpp"
 #include "coring/IOTask.hpp"
 #include "coring_epoll/EpollEngine.hpp"
+#include "coring_uring/UringEngine.hpp"
 
 template<Coring::IOEngineConcept Engine>
 Coring::IOTask handle_client(Coring::ClientSocket<Engine> client) {
@@ -104,14 +107,40 @@ Coring::IOTask accept_loop(Coring::AcceptorSocket<Engine> acceptor, Engine& engi
 }
 
 
-int main() {
-    auto engine = Coring::EpollEngine::create();
-
-    auto acceptor = Coring::AcceptorSocket<Coring::EpollEngine>::create(8080, *engine);
+int main2() {
+    auto engine = Coring::UringEngine::create();
+    auto acceptor = Coring::AcceptorSocket<Coring::UringEngine>::create(8081, *engine);
 
     Coring::spawn(accept_loop(std::move(*acceptor), *engine));
 
     engine->run();
 
+    return 0;
+}
+
+template<Coring::IOEngineConcept Engine>
+int coring_main(int port) {
+    auto engine = Engine::create();
+
+    auto acceptor = Coring::AcceptorSocket<Engine>::create(port, *engine);
+
+    Coring::spawn(accept_loop(std::move(*acceptor), *engine));
+    engine->run();
+    return 0;
+}
+
+
+
+int main() {
+    std::vector<std::jthread> threads;
+
+    std::println("threads: {}", std::thread::hardware_concurrency());
+    for (int i = 0; i < std::thread::hardware_concurrency() - 1; ++i) {
+        threads.emplace_back(coring_main<Coring::EpollEngine>, 8080);
+    }
+
+    coring_main<Coring::UringEngine>(8080);
+
+    //std::jthread th1(coring_main<Coring::UringEngine>, 8080);
     return 0;
 }

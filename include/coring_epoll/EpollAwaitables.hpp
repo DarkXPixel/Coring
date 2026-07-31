@@ -1,17 +1,17 @@
 #pragma once
-
-#include "coring/IOEngine.hpp"
 #include <cerrno>
 #include <coroutine>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#include "coring_epoll/EpollEngine.hpp"
+
 namespace Coring {
-    template<IOEngineConcept Engine>
-    struct AcceptAwaitable {
-        Engine& engine;
+    struct EpollAcceptAwaitable {
+        EpollEngine& engine;
         int listen_fd;
-        typename Engine::Context_t& ctx;
+        typename EpollEngine::Context_t& ctx;
 
         bool await_ready() noexcept {return false;}
         void await_suspend(std::coroutine_handle<> h) noexcept {
@@ -25,13 +25,12 @@ namespace Coring {
         }
     };
 
-    template<IOEngineConcept Engine>
-    struct ReadAwaitable {
-        Engine& engine;
+    struct EpollReadAwaitable {
+        EpollEngine& engine;
         int fd;
         void* buf;
         size_t len;
-        typename Engine::Context_t& ctx;
+        typename EpollEngine::Context_t& ctx;
 
         ssize_t bytes_read {-1};
         int read_errno{0};
@@ -70,13 +69,12 @@ namespace Coring {
         }
     };
 
-    template<IOEngineConcept Engine>
-    struct WriteAwaitable {
-        Engine& engine;
+    struct EpollWriteAwaitable {
+        EpollEngine& engine;
         int fd;
         const void* buf;
         size_t len;
-        typename Engine::Context_t& ctx;
+        typename EpollEngine::Context_t& ctx;
 
         bool await_ready() noexcept {return false;}
         void await_suspend(std::coroutine_handle<> h) noexcept {

@@ -25,6 +25,10 @@ namespace Coring {
         EpollEngine(int epoll_fd) : epoll_fd_(epoll_fd) {}
     public:
         using Context_t = EpollContext;
+        using AcceptAwaitable_t = struct EpollAcceptAwaitable;
+        using ReadAwaitable_t = struct EpollReadAwaitable;
+        using WriteAwaitable_t = struct EpollWriteAwaitable;
+
         
 
         EpollEngine(const EpollEngine&) = delete;
@@ -68,6 +72,7 @@ namespace Coring {
 
         void impl_unregister_fd(int fd) {
             ::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
+            ::close(fd);
         }
 
         void impl_run() {
@@ -111,3 +116,4 @@ namespace Coring {
     };
 
 }
+#include "EpollAwaitables.hpp"

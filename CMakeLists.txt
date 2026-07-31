@@ -11,7 +11,8 @@ find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(LIBURING REQUIRED liburing)
 
-add_executable(exe src/main.cpp)
+add_executable(exe src/main.cpp
+    src/coring_uring/UringEngine.cpp)
 
 target_include_directories(exe PRIVATE ${LIBURING_INCLUDE_DIRS})
 target_link_directories(exe PRIVATE ${LIBURING_LIBRARY_DIRS})

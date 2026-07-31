@@ -9,7 +9,6 @@
 #include <unistd.h>
 #include <utility>
 #include "IOEngine.hpp"
-#include "coring/Awaitables.hpp"
 
 namespace Coring {
     template<IOEngineConcept Engine>
@@ -29,7 +28,6 @@ namespace Coring {
         ~AcceptorSocket() {
             if(listen_fd_ >= 0) {
                 engine_.unregister_fd(listen_fd_);
-                ::close(listen_fd_);
                 listen_fd_ = -1;
             }
         }
@@ -68,7 +66,7 @@ namespace Coring {
         }
 
         auto async_accept() {
-            return AcceptAwaitable<Engine>{engine_, listen_fd_, ctx_};
+            return typename Engine::AcceptAwaitable_t{engine_, listen_fd_, ctx_};
         }
     };
 }
