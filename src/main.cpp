@@ -121,8 +121,14 @@ int main2() {
 template<Coring::IOEngineConcept Engine>
 int coring_main(int port) {
     auto engine = Engine::create();
+    if(!engine.has_value()) {
+        return -1;
+    }
 
     auto acceptor = Coring::AcceptorSocket<Engine>::create(port, *engine);
+    if(!acceptor.has_value()) {
+        return -1;
+    }
 
     Coring::spawn(accept_loop(std::move(*acceptor), *engine));
     engine->run();
@@ -132,15 +138,23 @@ int coring_main(int port) {
 
 
 int main() {
+    constexpr int PORT = 8080;
     std::vector<std::jthread> threads;
+    size_t num_threads = std::thread::hardware_concurrency() > 0 ? std::thread::hardware_concurrency() : 1;
+    std::println("threads: {}", num_threads);
 
-    std::println("threads: {}", std::thread::hardware_concurrency());
-    for (int i = 0; i < std::thread::hardware_concurrency() - 1; ++i) {
-        threads.emplace_back(coring_main<Coring::EpollEngine>, 8080);
+    auto run_cluster = [&]<typename Engine>() {
+        threads.reserve(num_threads - 1);
+        for(size_t i = 0; i < num_threads - 1; ++i) {
+            threads.emplace_back(coring_main<Engine>, PORT);
+        }
+        coring_main<Engine>(PORT);
+    };
+
+    if(Coring::UringEngine::is_io_uring_supported()) {
+       run_cluster.operator()<Coring::UringEngine>();
+    } else {
+       run_cluster.operator()<Coring::EpollEngine>();
     }
-
-    coring_main<Coring::EpollEngine>(8080);
-
-    //std::jthread th1(coring_main<Coring::UringEngine>, 8080);
     return 0;
 }

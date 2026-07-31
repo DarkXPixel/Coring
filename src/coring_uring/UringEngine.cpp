@@ -1,6 +1,7 @@
 #include "coring_uring/UringEngine.hpp"
 #include <cerrno>
 #include <coroutine>
+#include <cstdio>
 #include <expected>
 #include <liburing.h>
 #include <liburing/io_uring.h>
@@ -11,6 +12,17 @@
 
 
 namespace Coring {
+    bool UringEngine::is_io_uring_supported() {
+        io_uring ring;
+        int ret = io_uring_queue_init(2, &ring, 0);
+        if(ret == 0) {
+            io_uring_queue_exit(&ring);
+            return true;
+        }
+        std::println(stderr, "io_uring not supported... Fallback epoll");
+        return false;
+    }
+
     std::expected<UringEngine, std::error_code> UringEngine::create() {
         io_uring ring;
         int err;

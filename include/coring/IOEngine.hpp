@@ -3,7 +3,9 @@
 
 #include <atomic>
 #include <coroutine>
+#include <system_error>
 #include <vector>
+#include <expected>
 namespace Coring {
    
     template <typename Engine>
@@ -15,6 +17,7 @@ namespace Coring {
     typename Engine::ReadAwaitable_t;
     typename Engine::WriteAwaitable_t;                            
 
+    {Engine::create()} ->std::same_as<std::expected<Engine, std::error_code>>;
     { engine.async_accept(fd, ctx, h) };
     { engine.async_read(fd, buf, len, ctx, h) };
     { engine.async_write(fd, buf, len, ctx, h) };

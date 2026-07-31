@@ -28,6 +28,8 @@ namespace Coring {
 
         UringEngine(UringEngine&& other) : ring_(std::exchange(other.ring_, {})){}
 
+
+        static bool is_io_uring_supported();
         using Context_t = UringContext;
         using AcceptAwaitable_t = struct UringAcceptAwaitable;
         using ReadAwaitable_t = struct UringReadAwaitable;
