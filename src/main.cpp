@@ -3,18 +3,32 @@
 #include "../include/Task.hpp"
 #include <print>
 #include <iostream>
+#include <pthread.h>
 #include <sched.h>
 #include <string_view>
 #include <sys/types.h>
 #include <thread>
+#include <unordered_map>
 #include <vector>
+#include <unordered_map>
+#include "coring/CoringServer.hpp"
 #include "HttpRequest.hpp"
 #include "coring/AcceptorSocket.hpp"
 #include "coring/ClientSocket.hpp"
 #include "coring/IOEngine.hpp"
 #include "coring/IOTask.hpp"
+#include "coring/status.hpp"
 #include "coring_epoll/EpollEngine.hpp"
 #include "coring_uring/UringEngine.hpp"
+#include "coring/html404.hpp"
+
+
+
+std::unordered_map<std::string, Coring::RouteRule> g_Rules;
+
+
+
+
 
 template<Coring::IOEngineConcept Engine>
 Coring::IOTask handle_client(Coring::ClientSocket<Engine> client) {
@@ -34,6 +48,60 @@ Coring::IOTask handle_client(Coring::ClientSocket<Engine> client) {
 
         std::string_view raw_headers(raw_buffer.data(), header_end_pos);
         Coring::HttpRequest request = Coring::parse_http_headers(raw_headers);
+
+        Coring::HandlerType handler_type = Coring::HandlerType::NotFound;
+
+        {
+            auto it = g_Rules.find(request.path);
+            if(it != g_Rules.end()) {
+                handler_type = it->second.type;
+            }
+        }
+
+
+        if(handler_type == Coring::HandlerType::NotFound) {
+            std::string HTTP_RESPONSE = std::format( 
+            "HTTP/1.1 404 Not Found\r\n"
+            "Server: Coring\r\n"
+            "Content-Type: text/html; charset=UTF-8\r\n"
+            "Content-Length: {}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{}"
+            , Coring::Utilites::HTML_404_ERROR.length(), Coring::Utilites::HTML_404_ERROR.data());
+
+
+            int bytes_needed_write = HTTP_RESPONSE.size();
+            while(bytes_needed_write > 0) {
+                int bytes_written = co_await client.async_write(HTTP_RESPONSE.data() + (HTTP_RESPONSE.size() - bytes_needed_write), bytes_needed_write);
+                if(bytes_written <= 0) {
+                    break;
+                }
+                bytes_needed_write -= bytes_written;
+            }
+            co_return;
+        } else if(handler_type == Coring::HandlerType::Status) {
+            std::string HTTP_RESPONSE = std::format(
+                "HTTP/1.1 200 OK\r\n"
+                "Server: Coring\r\n"
+                "Content-Type: text/html; charset=UTF-8\r\n"
+                "Content-Length: {}"
+                "Connection: close\r\n"
+                "\r\n"
+                "{}"
+            , Coring::Utilites::HTML_200_STATUS.length(), Coring::Utilites::HTML_200_STATUS.data());
+
+            int bytes_needed_write = HTTP_RESPONSE.size();
+            while(bytes_needed_write > 0) {
+                int bytes_written = co_await client.async_write(HTTP_RESPONSE.data() + (HTTP_RESPONSE.size() - bytes_needed_write), bytes_needed_write);
+                if(bytes_written <= 0) {
+                    break;
+                }
+                bytes_needed_write -= bytes_written;
+            }
+            co_return;
+        }
+        
 
         size_t body_start_pos = header_end_pos + 4;
 
@@ -78,15 +146,36 @@ Coring::IOTask handle_client(Coring::ClientSocket<Engine> client) {
             }
 
 
-        std::string_view body = "Hello World!";
-        std::string response = std::format(
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/plain\r\n"
-                "Content-Length: {}\r\n"
-                "Connection: {}\r\n"
-                "{}"
-                "\r\n"
-                "{}", body.size(),keep_alive ? "keep-alive" : "close", keep_alive ? "Keep-Alive: timeout=5, max=1000\r\n" : "", body);
+        constexpr std::string_view HTTP_RESP_KEEPALIVE = 
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 12\r\n"
+            "Connection: keep-alive\r\n"
+            "Keep-Alive: timeout=5, max=1000\r\n"
+            "\r\n"
+            "Hello World!";
+
+        // Ответ для Close
+        constexpr std::string_view HTTP_RESP_CLOSE = 
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 12\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "Hello World!";
+
+        // Внутри обработчика:
+        std::string_view response = keep_alive ? HTTP_RESP_KEEPALIVE : HTTP_RESP_CLOSE;
+            
+        // std::string_view body = "Hello World!";
+        // std::string response = std::format(
+        //         "HTTP/1.1 200 OK\r\n"
+        //         "Content-Type: text/plain\r\n"
+        //         "Content-Length: {}\r\n"
+        //         "Connection: {}\r\n"
+        //         "{}"
+        //         "\r\n"
+        //         "{}", body.size(),keep_alive ? "keep-alive" : "close", keep_alive ? "Keep-Alive: timeout=5, max=1000\r\n" : "", body);
 
         auto bytes_written = co_await client.async_write(response.data(), response.size());
         if(!keep_alive) {
@@ -107,19 +196,20 @@ Coring::IOTask accept_loop(Coring::AcceptorSocket<Engine> acceptor, Engine& engi
 }
 
 
-int main2() {
-    auto engine = Coring::UringEngine::create();
-    auto acceptor = Coring::AcceptorSocket<Coring::UringEngine>::create(8081, *engine);
-
-    Coring::spawn(accept_loop(std::move(*acceptor), *engine));
-
-    engine->run();
-
-    return 0;
+inline void pin_thread_to_core(size_t core_id) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset);
+    pthread_t current_thread = pthread_self();
+    int rc = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    if(rc != 0) {
+        std::println(stderr, "Error pinning thread to core {}: {}", core_id, rc);
+    }
 }
 
 template<Coring::IOEngineConcept Engine>
-int coring_main(int port) {
+int coring_main(int port, size_t core_id) {
+    pin_thread_to_core(core_id);
     auto engine = Engine::create();
     if(!engine.has_value()) {
         return -1;
@@ -143,12 +233,19 @@ int main() {
     size_t num_threads = std::thread::hardware_concurrency() > 0 ? std::thread::hardware_concurrency() : 1;
     std::println("threads: {}", num_threads);
 
+
+    g_Rules["/test/status"] = Coring::RouteRule{
+        .path = "/test/status",
+        .type = Coring::HandlerType::Status,
+        .rule = {}
+    };
+
     auto run_cluster = [&]<typename Engine>() {
         threads.reserve(num_threads - 1);
         for(size_t i = 0; i < num_threads - 1; ++i) {
-            threads.emplace_back(coring_main<Engine>, PORT);
+            threads.emplace_back(coring_main<Engine>, PORT, i);
         }
-        coring_main<Engine>(PORT);
+        coring_main<Engine>(PORT, num_threads - 1);
     };
 
     if(Coring::UringEngine::is_io_uring_supported()) {

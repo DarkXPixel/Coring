@@ -19,7 +19,7 @@ namespace Coring {
     class UringEngine : public IOEngineBase<UringEngine>{
         io_uring ring_;
         bool valid_{false};
-        static constexpr auto QUEUE_DEPTH = 256;
+        static constexpr auto QUEUE_DEPTH = 1024;
 
         UringEngine(io_uring ring) : ring_(ring), valid_(true) {}
     public:
