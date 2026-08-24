@@ -16,14 +16,14 @@ namespace Coring {
     private:
         int listen_fd_{-1};
         Engine& engine_;
-        typename Engine::Context_t ctx_{};
+        int port_;
 
-        AcceptorSocket(int fd, Engine& engine) : listen_fd_(fd), engine_(engine) {}
+        AcceptorSocket(int fd, Engine& engine, int port) : listen_fd_(fd), engine_(engine), port_(port) {}
     public:
         AcceptorSocket(const AcceptorSocket&) = delete;
         AcceptorSocket& operator=(const AcceptorSocket&) = delete;
 
-        AcceptorSocket(AcceptorSocket&& other) noexcept : listen_fd_(std::exchange(other.listen_fd_, -1)), engine_(other.engine_), ctx_(other.ctx_) {}
+        AcceptorSocket(AcceptorSocket&& other) noexcept : listen_fd_(std::exchange(other.listen_fd_, -1)), engine_(other.engine_) {}
 
         ~AcceptorSocket() {
             if(listen_fd_ >= 0) {
@@ -58,15 +58,19 @@ namespace Coring {
                 ::close(fd);
                 return std::unexpected(std::error_code(err, std::generic_category()));
             }
-            return AcceptorSocket(fd, engine);
+            return AcceptorSocket(fd, engine, port);
         }
 
         int fd() const {
             return listen_fd_;
         }
 
+        int port() const {
+            return port_;
+        }
+
         auto async_accept() {
-            return typename Engine::AcceptAwaitable_t{engine_, listen_fd_, ctx_};
+            return typename Engine::AcceptAwaitable_t{engine_, listen_fd_};
         }
     };
 }

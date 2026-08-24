@@ -1,257 +1,266 @@
-#include <cstddef>
 #include <liburing.h>
-#include "../include/Task.hpp"
-#include <print>
-#include <iostream>
 #include <pthread.h>
 #include <sched.h>
-#include <string_view>
 #include <sys/types.h>
-#include <thread>
-#include <unordered_map>
-#include <vector>
-#include <unordered_map>
 #include "coring/CoringServer.hpp"
 #include "HttpRequest.hpp"
 #include "coring/AcceptorSocket.hpp"
 #include "coring/ClientSocket.hpp"
+#include "coring/IOContext.hpp"
 #include "coring/IOEngine.hpp"
 #include "coring/IOTask.hpp"
 #include "coring/status.hpp"
-#include "coring_epoll/EpollEngine.hpp"
+// #include "coring_epoll/EpollEngine.hpp"
 #include "coring_uring/UringEngine.hpp"
 #include "coring/html404.hpp"
+#include "utility/CliParser.hpp"
 
 
 
-std::unordered_map<std::string, Coring::RouteRule> g_Rules;
+// import std;
+
+// std::unordered_map<std::string, Coring::RouteRule> g_Rules;
 
 
 
 
+// template<Coring::IOEngineConcept Engine>
+// Coring::IOTask handle_client(Coring::ClientSocket<Engine> client) {
+//     char buffer[1024];
+//     std::string raw_buffer;
+//     raw_buffer.reserve(8196);
+//     while(true) {
+//         size_t header_end_pos = raw_buffer.find("\r\n\r\n");
 
-template<Coring::IOEngineConcept Engine>
-Coring::IOTask handle_client(Coring::ClientSocket<Engine> client) {
-    char buffer[1024];
-    std::string raw_buffer;
-    while(true) {
-        size_t header_end_pos = raw_buffer.find("\r\n\r\n");
+//         while(header_end_pos == std::string::npos) {
+//             auto bytes_read = co_await client.async_read(buffer, sizeof(buffer));
+//             if(bytes_read <= 0) {
+//                 co_return;
+//             }
+//             raw_buffer.append(buffer, bytes_read);
+//             header_end_pos = raw_buffer.find("\r\n\r\n");
+//             if(raw_buffer.size() >= 8196) {
+//                 co_return;
+//             }
+//         }
 
-        while(header_end_pos == std::string::npos) {
-            auto bytes_read = co_await client.async_read(buffer, sizeof(buffer));
-            if(bytes_read <= 0) {
-                co_return;
-            }
-            raw_buffer.append(buffer, bytes_read);
-            header_end_pos = raw_buffer.find("\r\n\r\n");
-        }
+//         std::string_view raw_headers(raw_buffer.data(), header_end_pos);
+//         Coring::HttpRequest request = Coring::parse_http_headers(raw_headers);
 
-        std::string_view raw_headers(raw_buffer.data(), header_end_pos);
-        Coring::HttpRequest request = Coring::parse_http_headers(raw_headers);
+//         Coring::HandlerType handler_type = Coring::HandlerType::NotFound;
 
-        Coring::HandlerType handler_type = Coring::HandlerType::NotFound;
-
-        {
-            auto it = g_Rules.find(request.path);
-            if(it != g_Rules.end()) {
-                handler_type = it->second.type;
-            }
-        }
-
-
-        if(handler_type == Coring::HandlerType::NotFound) {
-            std::string HTTP_RESPONSE = std::format( 
-            "HTTP/1.1 404 Not Found\r\n"
-            "Server: Coring\r\n"
-            "Content-Type: text/html; charset=UTF-8\r\n"
-            "Content-Length: {}\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{}"
-            , Coring::Utilites::HTML_404_ERROR.length(), Coring::Utilites::HTML_404_ERROR.data());
+//         {
+//             auto it = g_Rules.find(request.path);
+//             if(it != g_Rules.end()) {
+//                 handler_type = it->second.type;
+//             }
+//         }
 
 
-            int bytes_needed_write = HTTP_RESPONSE.size();
-            while(bytes_needed_write > 0) {
-                int bytes_written = co_await client.async_write(HTTP_RESPONSE.data() + (HTTP_RESPONSE.size() - bytes_needed_write), bytes_needed_write);
-                if(bytes_written <= 0) {
-                    break;
-                }
-                bytes_needed_write -= bytes_written;
-            }
-            co_return;
-        } else if(handler_type == Coring::HandlerType::Status) {
-            std::string HTTP_RESPONSE = std::format(
-                "HTTP/1.1 200 OK\r\n"
-                "Server: Coring\r\n"
-                "Content-Type: text/html; charset=UTF-8\r\n"
-                "Content-Length: {}"
-                "Connection: close\r\n"
-                "\r\n"
-                "{}"
-            , Coring::Utilites::HTML_200_STATUS.length(), Coring::Utilites::HTML_200_STATUS.data());
+//         if(handler_type == Coring::HandlerType::NotFound) {
+//             std::string HTTP_RESPONSE = std::format( 
+//             "HTTP/1.1 404 Not Found\r\n"
+//             "Server: Coring\r\n"
+//             "Content-Type: text/html; charset=UTF-8\r\n"
+//             "Content-Length: {}\r\n"
+//             "Connection: close\r\n"
+//             "\r\n"
+//             "{}"
+//             , Coring::Utilites::HTML_404_ERROR.length(), Coring::Utilites::HTML_404_ERROR.data());
 
-            int bytes_needed_write = HTTP_RESPONSE.size();
-            while(bytes_needed_write > 0) {
-                int bytes_written = co_await client.async_write(HTTP_RESPONSE.data() + (HTTP_RESPONSE.size() - bytes_needed_write), bytes_needed_write);
-                if(bytes_written <= 0) {
-                    break;
-                }
-                bytes_needed_write -= bytes_written;
-            }
-            co_return;
-        }
+
+//             int bytes_needed_write = HTTP_RESPONSE.size();
+//             while(bytes_needed_write > 0) {
+//                 int bytes_written = co_await client.async_write(HTTP_RESPONSE.data() + (HTTP_RESPONSE.size() - bytes_needed_write), bytes_needed_write);
+//                 if(bytes_written <= 0) {
+//                     break;
+//                 }
+//                 bytes_needed_write -= bytes_written;
+//             }
+//             co_return;
+//         } else if(handler_type == Coring::HandlerType::Status) {
+//             std::string HTTP_RESPONSE = std::format(
+//                 "HTTP/1.1 200 OK\r\n"
+//                 "Server: Coring\r\n"
+//                 "Content-Type: text/html; charset=UTF-8\r\n"
+//                 "Content-Length: {}"
+//                 "Connection: close\r\n"
+//                 "\r\n"
+//                 "{}"
+//             , Coring::Utilites::HTML_200_STATUS.length(), Coring::Utilites::HTML_200_STATUS.data());
+
+//             int bytes_needed_write = HTTP_RESPONSE.size();
+//             while(bytes_needed_write > 0) {
+//                 int bytes_written = co_await client.async_write(HTTP_RESPONSE.data() + (HTTP_RESPONSE.size() - bytes_needed_write), bytes_needed_write);
+//                 if(bytes_written <= 0) {
+//                     break;
+//                 }
+//                 bytes_needed_write -= bytes_written;
+//             }
+//             co_return;
+//         }
         
+//         co_return;
 
-        size_t body_start_pos = header_end_pos + 4;
+//         size_t body_start_pos = header_end_pos + 4;
 
-        size_t content_lenght = 0;
-        auto it = request.headers.find("content-length");
-        if(it != request.headers.end()) {
-            content_lenght = std::stoull(it->second);
-        }
+//         size_t content_lenght = 0;
+//         auto it = request.headers.find("content-length");
+//         if(it != request.headers.end()) {
+//             content_lenght = std::stoull(it->second);
+//         }
 
-        bool keep_alive = true;
-        auto conn_it = request.headers.find("connection");
-        if(conn_it != request.headers.end()) {
-            std::string_view val = conn_it->second;
-            if(val == "close") {
-                keep_alive = false;
-            } else {
-                keep_alive = true;
-            }
-        }
+//         bool keep_alive = true;
+//         auto conn_it = request.headers.find("connection");
+//         if(conn_it != request.headers.end()) {
+//             std::string_view val = conn_it->second;
+//             if(val == "close") {
+//                 keep_alive = false;
+//             } else {
+//                 keep_alive = true;
+//             }
+//         }
 
-        size_t bytes_already_read = raw_buffer.size() - body_start_pos;
+//         size_t bytes_already_read = raw_buffer.size() - body_start_pos;
 
-        request.body.reserve(content_lenght);
-        if(bytes_already_read > 0) {
-            request.body.append(raw_buffer.data() + body_start_pos, std::min(bytes_already_read, content_lenght));
-        }
-        while(request.body.size() < content_lenght) {
-                size_t bytes_needed = content_lenght - request.body.size();
-                size_t read_size = std::min(sizeof(buffer), bytes_needed);
-                auto bytes_read = co_await client.async_read(buffer, read_size);
-                if(bytes_read <= 0) {
-                    break;
-                }
-                request.body.append(buffer, bytes_read);
-        }
+//         request.body.reserve(content_lenght);
+//         if(bytes_already_read > 0) {
+//             request.body.append(raw_buffer.data() + body_start_pos, std::min(bytes_already_read, content_lenght));
+//         }
+//         while(request.body.size() < content_lenght) {
+//                 size_t bytes_needed = content_lenght - request.body.size();
+//                 size_t read_size = std::min(sizeof(buffer), bytes_needed);
+//                 auto bytes_read = co_await client.async_read(buffer, read_size);
+//                 if(bytes_read <= 0) {
+//                     break;
+//                 }
+//                 request.body.append(buffer, bytes_read);
+//         }
 
-         size_t total_processed_bytes = body_start_pos + content_lenght;
-            if(raw_buffer.size() > total_processed_bytes) {
-                raw_buffer.erase(0, total_processed_bytes);
-            } else {
-                raw_buffer.clear();
-            }
+//          size_t total_processed_bytes = body_start_pos + content_lenght;
+//             if(raw_buffer.size() > total_processed_bytes) {
+//                 raw_buffer.erase(0, total_processed_bytes);
+//             } else {
+//                 raw_buffer.clear();
+//             }
 
 
-        constexpr std::string_view HTTP_RESP_KEEPALIVE = 
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 12\r\n"
-            "Connection: keep-alive\r\n"
-            "Keep-Alive: timeout=5, max=1000\r\n"
-            "\r\n"
-            "Hello World!";
+//         constexpr std::string_view HTTP_RESP_KEEPALIVE = 
+//             "HTTP/1.1 200 OK\r\n"
+//             "Content-Type: text/plain\r\n"
+//             "Content-Length: 12\r\n"
+//             "Connection: keep-alive\r\n"
+//             "Keep-Alive: timeout=5, max=1000\r\n"
+//             "\r\n"
+//             "Hello World!";
 
-        // Ответ для Close
-        constexpr std::string_view HTTP_RESP_CLOSE = 
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: text/plain\r\n"
-            "Content-Length: 12\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "Hello World!";
+//         // Ответ для Close
+//         constexpr std::string_view HTTP_RESP_CLOSE = 
+//             "HTTP/1.1 200 OK\r\n"
+//             "Content-Type: text/plain\r\n"
+//             "Content-Length: 12\r\n"
+//             "Connection: close\r\n"
+//             "\r\n"
+//             "Hello World!";
 
-        // Внутри обработчика:
-        std::string_view response = keep_alive ? HTTP_RESP_KEEPALIVE : HTTP_RESP_CLOSE;
+//         // Внутри обработчика:
+//         std::string_view response = keep_alive ? HTTP_RESP_KEEPALIVE : HTTP_RESP_CLOSE;
             
-        // std::string_view body = "Hello World!";
-        // std::string response = std::format(
-        //         "HTTP/1.1 200 OK\r\n"
-        //         "Content-Type: text/plain\r\n"
-        //         "Content-Length: {}\r\n"
-        //         "Connection: {}\r\n"
-        //         "{}"
-        //         "\r\n"
-        //         "{}", body.size(),keep_alive ? "keep-alive" : "close", keep_alive ? "Keep-Alive: timeout=5, max=1000\r\n" : "", body);
+//         // std::string_view body = "Hello World!";
+//         // std::string response = std::format(
+//         //         "HTTP/1.1 200 OK\r\n"
+//         //         "Content-Type: text/plain\r\n"
+//         //         "Content-Length: {}\r\n"
+//         //         "Connection: {}\r\n"
+//         //         "{}"
+//         //         "\r\n"
+//         //         "{}", body.size(),keep_alive ? "keep-alive" : "close", keep_alive ? "Keep-Alive: timeout=5, max=1000\r\n" : "", body);
 
-        auto bytes_written = co_await client.async_write(response.data(), response.size());
-        if(!keep_alive) {
-            co_return;
-        }
-        //co_return;
-    }
-}
+//         auto bytes_written = co_await client.async_write(response.data(), response.size());
+//         if(!keep_alive) {
+//             co_return;
+//         }
+//         //co_return;
+//     }
+// }
 
-template<Coring::IOEngineConcept Engine>
-Coring::IOTask accept_loop(Coring::AcceptorSocket<Engine> acceptor, Engine& engine) {
-    while(true) {
-        int client_fd = co_await acceptor.async_accept();
-        if(client_fd >= 0) {
-            Coring::spawn(handle_client(Coring::ClientSocket<Engine>{client_fd, engine}));
-        }
-    }
-}
+// template<Coring::IOEngineConcept Engine>
+// Coring::IOTask accept_loop(Coring::AcceptorSocket<Engine> acceptor, Engine& engine) {
+//     while(true) {
+//         int client_fd = co_await acceptor.async_accept();
+//         if(client_fd >= 0) {
+//             Coring::spawn(handle_client(Coring::ClientSocket<Engine>{client_fd, engine}));
+//         }
+//     }
+// }
 
 
-inline void pin_thread_to_core(size_t core_id) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core_id, &cpuset);
-    pthread_t current_thread = pthread_self();
-    int rc = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
-    if(rc != 0) {
-        std::println(stderr, "Error pinning thread to core {}: {}", core_id, rc);
-    }
-}
+// inline void pin_thread_to_core(size_t core_id) {
+//     cpu_set_t cpuset;
+//     CPU_ZERO(&cpuset);
+//     CPU_SET(core_id, &cpuset);
+//     pthread_t current_thread = pthread_self();
+//     int rc = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+//     if(rc != 0) {
+//         std::println(stderr, "Error pinning thread to core {}: {}", core_id, rc);
+//     }
+// }
 
-template<Coring::IOEngineConcept Engine>
-int coring_main(int port, size_t core_id) {
-    pin_thread_to_core(core_id);
-    auto engine = Engine::create();
-    if(!engine.has_value()) {
+// template<Coring::IOEngineConcept Engine>
+// int coring_main(int port, size_t core_id) {
+//     pin_thread_to_core(core_id);
+//     auto engine = Engine::create();
+//     if(!engine.has_value()) {
+//         return -1;
+//     }
+
+//     auto acceptor = Coring::AcceptorSocket<Engine>::create(port, *engine);
+//     if(!acceptor.has_value()) {
+//         return -1;
+//     }
+
+//     Coring::spawn(accept_loop(std::move(*acceptor), *engine));
+//     engine->run();
+//     return 0;
+// }
+
+
+
+int main(int argc, char* argv[]) {
+    auto cfg = Coring::Utility::CliParser::parse_args(argc, argv);
+    if(!cfg) {
+        std::println(stderr, "Error: {}", Coring::Utility::to_string(cfg.error()));
         return -1;
     }
 
-    auto acceptor = Coring::AcceptorSocket<Engine>::create(port, *engine);
-    if(!acceptor.has_value()) {
-        return -1;
-    }
-
-    Coring::spawn(accept_loop(std::move(*acceptor), *engine));
-    engine->run();
+    Coring::Coring c(cfg.value());
+    c.run();
     return 0;
-}
+
+    // constexpr int PORT = 8080;
+    // std::vector<std::jthread> threads;
+    // size_t num_threads = std::thread::hardware_concurrency() > 0 ? std::thread::hardware_concurrency() : 1;
+    // std::println("threads: {}", num_threads);
 
 
+    // g_Rules["/test/status"] = Coring::RouteRule{
+    //     .path = "/test/status",
+    //     .type = Coring::HandlerType::Status,
+    //     .rule = {}
+    // };
 
-int main() {
-    constexpr int PORT = 8080;
-    std::vector<std::jthread> threads;
-    size_t num_threads = std::thread::hardware_concurrency() > 0 ? std::thread::hardware_concurrency() : 1;
-    std::println("threads: {}", num_threads);
+    // auto run_cluster = [&]<typename Engine>() {
+    //     threads.reserve(num_threads - 1);
+    //     for(size_t i = 0; i < num_threads - 1; ++i) {
+    //         threads.emplace_back(coring_main<Engine>, PORT, i);
+    //     }
+    //     coring_main<Engine>(PORT, num_threads - 1);
+    // };
 
-
-    g_Rules["/test/status"] = Coring::RouteRule{
-        .path = "/test/status",
-        .type = Coring::HandlerType::Status,
-        .rule = {}
-    };
-
-    auto run_cluster = [&]<typename Engine>() {
-        threads.reserve(num_threads - 1);
-        for(size_t i = 0; i < num_threads - 1; ++i) {
-            threads.emplace_back(coring_main<Engine>, PORT, i);
-        }
-        coring_main<Engine>(PORT, num_threads - 1);
-    };
-
-    if(Coring::UringEngine::is_io_uring_supported()) {
-       run_cluster.operator()<Coring::UringEngine>();
-    } else {
-       run_cluster.operator()<Coring::EpollEngine>();
-    }
-    return 0;
+    // if(Coring::UringEngine::is_io_uring_supported()) {
+    //    run_cluster.operator()<Coring::UringEngine>();
+    // } else {
+    //    run_cluster.operator()<Coring::EpollEngine>();
+    // }
+    // return 0;
 }

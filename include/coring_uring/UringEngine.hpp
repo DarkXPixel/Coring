@@ -9,10 +9,8 @@
 #include <utility>
 namespace Coring {
     struct UringContext {
-        std::coroutine_handle<> h;
-        void* buf;
-        socklen_t* addrlen{nullptr};
-        int res;
+        std::coroutine_handle<> h{nullptr};
+        int res{0};
     };
 
 
@@ -38,9 +36,9 @@ namespace Coring {
         ~UringEngine();
         static std::expected<UringEngine, std::error_code> create();
 
-        void impl_async_accept(int listen_fd, UringContext& ctx, std::coroutine_handle<> h);
-        void impl_async_read(int fd, void* buf, size_t len, UringContext& ctx, std::coroutine_handle<> h);
-        void impl_async_write(int fd, const void* buf, size_t len, UringContext& ctx, std::coroutine_handle<> h);
+        void impl_async_accept(int listen_fd, struct sockaddr* addr, socklen_t* len, UringContext& ctx);
+        void impl_async_read(int fd, void* buf, size_t len, UringContext& ctx);
+        void impl_async_write(int fd, const void* buf, size_t len, UringContext& ctx);
         void impl_unregister_fd(int fd);
         void impl_run();
     };

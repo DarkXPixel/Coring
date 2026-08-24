@@ -6,10 +6,11 @@
             "displayName": "GCC 16.0.1 x86_64-linux-gnu-debug",
             "description": "Using compilers: C = /usr/bin/gcc-16, CXX = /usr/bin/g++-16",
             "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "generator": "Ninja",
             "cacheVariables": {
                 "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
-                "CMAKE_C_COMPILER": "/usr/bin/gcc-16",
-                "CMAKE_CXX_COMPILER": "/usr/bin/g++-16",
+                "CMAKE_C_COMPILER": "/usr/bin/clang",
+                "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
                 "CMAKE_BUILD_TYPE": "Debug"
             }
         },

@@ -21,7 +21,9 @@ namespace Coring {
         int await_resume() noexcept {
             sockaddr_in addr{};
             socklen_t len = sizeof(addr);
-            return ::accept4(listen_fd, (sockaddr*)&addr, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            int res = ::accept4(listen_fd, (sockaddr*)&addr, &len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+            //ctx.port = ntohs(addr.sin_port);
+            return res;
         }
     };
 
