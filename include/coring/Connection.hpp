@@ -22,6 +22,8 @@ namespace Coring {
         
         IOTask2<> handle_client();
 
+        IOTask2<> test(std::string_view text);
+
     private:
         ClientSocket<Engine> socket_;
     };

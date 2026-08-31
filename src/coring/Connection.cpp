@@ -8,17 +8,30 @@
 namespace Coring {
     template<IOEngineConcept Engine>
     IOTask2<> Connection<Engine>::handle_client() {
+        std::array<std::byte, 1024> buf;
         
+        int len = co_await socket_.async_read(buf.data(), buf.size());
 
-        static const std::string HTTP_RESPONSE = std::format( 
+        std::string_view text = std::string_view(reinterpret_cast<char*>(buf.data()), len);
+
+        len = text.find("\r\n");
+        text.remove_prefix(len);
+
+        co_await test(text);
+    }
+    
+    template<IOEngineConcept Engine>
+    IOTask2<> Connection<Engine>::test(std::string_view text) {
+         static const std::string HTTP_RESPONSE = std::format( 
         "HTTP/1.1 404 Not Found\r\n"
         "Server: Coring\r\n"
         "Content-Type: text/html; charset=UTF-8\r\n"
         "Content-Length: {}\r\n"
         "Connection: close\r\n"
+        "Test: {}\r\n"
         "\r\n"
         "{}"
-        , Utilites::HTML_404_ERROR.length(), Utilites::HTML_404_ERROR.data());
+        , Utilites::HTML_404_ERROR.length(), text, Utilites::HTML_404_ERROR);
 
 
         int bytes_needed_write = HTTP_RESPONSE.size();
@@ -31,7 +44,6 @@ namespace Coring {
         }
         co_return;
     }
-
     template class Connection<UringEngine>;
 
 }

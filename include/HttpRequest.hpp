@@ -52,6 +52,10 @@ namespace Coring {
                 for(char& c : key) {
                     c = std::tolower(c);
                 }
+
+                for(char& c : value) {
+                    c = std::tolower(c);
+                }
                 req.headers[key] = value;
             }
             pos = next_line + 2;

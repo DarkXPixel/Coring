@@ -1,14 +1,12 @@
-cmake_minimum_required(VERSION 4.3)
+cmake_minimum_required(VERSION 3.30)
 
-set(CMAKE_EXPERIMENTAL_CXX_IMPORT_STD "451f2fe2-a8a2-47c3-bc32-94786d8fc91b")
 project(Coring LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-
-set(CMAKE_CXX_SCAN_FOR_MODULES ON)
+set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 find_package(PkgConfig REQUIRED)
 
@@ -20,9 +18,9 @@ add_executable(exe src/main.cpp
     src/utility/CliParser.cpp
     src/coring/IOContext.cpp
     src/system/SystemInfo.cpp
-    src/coring/Connection.cpp)
+    src/coring/Connection.cpp
+    src/coring2/TcpConnection.cpp)
 
-set_property(TARGET exe PROPERTY CXX_MODULE_STD ON)
 
 target_include_directories(exe PRIVATE ${LIBURING_INCLUDE_DIRS})
 target_link_directories(exe PRIVATE ${LIBURING_LIBRARY_DIRS})
