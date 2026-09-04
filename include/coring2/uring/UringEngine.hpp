@@ -19,9 +19,9 @@ public:
     io_uring_params params{};
 
     UringEngine2 engine;
-    int res{0};
-    if ((res = io_uring_queue_init_params(QUEUE_DEPTH, &engine.ring_,
-                                          &params)) < 0) {
+    if (int res =
+            io_uring_queue_init_params(QUEUE_DEPTH, &engine.ring_, &params);
+        res < 0) {
       return std::unexpected(std::format("Failed to init io_uring: {}", res));
     }
     return engine;

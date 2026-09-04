@@ -2,32 +2,46 @@
 #include "coring2/Buffer.hpp"
 #include "coring2/Deffer.hpp"
 #include "coring2/IOContext.hpp"
-#include "coring2/ProtocolHandler.hpp"
-// #include "coring2/uring/UringEventLoop.hpp"
+// #include "coring2/ProtocolHandler.hpp"
+#include "coring2/FixedBufferPool.hpp"
+#include "http1/http1_handler.hpp"
+#include "protocol/uninit_protocol.hpp"
 #include <array>
+#include <cassert>
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <print>
 #include <unistd.h>
+#include <variant>
 #include <vector>
 
 namespace Coring2 {
+
+struct BufferHeader {
+  std::byte *next{nullptr};
+  uint32_t size{0};
+  uint32_t offset{0};
+};
+
 template <typename LoopType> class alignas(64) TcpConnection {
-  enum class State : uint8_t { Active, Closing };
+  enum class State : uint8_t { Active = 0, Closing = 1 };
 
 public:
-  std::vector<std::byte> write_buf_; // temp
-  std::unique_ptr<IProtocolHandler<LoopType>> handler_{nullptr};
-  std::size_t bytes_sent_{0};
+  std::variant<UninitProtocol<LoopType>, Http1Handler_<LoopType>> handler_{
+      UninitProtocol<LoopType>{}};
   int socket_fd_{-1};
   uint8_t pending_io_count_ : 6 {0};
-  State state_ : 2 {TcpConnection::State::Active};
-  bool is_writing_ : 1 {false};
-  uint8_t padding_flags_ : 7 {0};
+  State state_ : 1 {TcpConnection::State::Active};
+  FixedBufferPool4096 &pool_buffer_;
 
-public:
-  TcpConnection(int fd);
+  std::byte *write_head_{nullptr};
+  std::byte *write_tail_{nullptr};
+
+  bool multishot_enable : 1 = true;
+
+  TcpConnection(int fd, FixedBufferPool4096 &pool_buffer);
 
   ~TcpConnection() {
     if (socket_fd_ >= 0) {
@@ -35,7 +49,7 @@ public:
     }
   }
 
-  inline void on_io_completed() noexcept {
+  void on_io_completed() noexcept {
     --pending_io_count_;
     if (state_ == State::Closing && pending_io_count_ == 0) {
       delete this; // temp
@@ -58,24 +72,50 @@ public:
 
     std::span<const std::byte> recieved_data(static_cast<std::byte *>(buf),
                                              res);
-    auto response = handler_->on_data(loop, recieved_data);
+    auto response = std::visit(
+        [&loop, &recieved_data, this](auto &&h) {
+          return h.on_data(loop, *this, recieved_data);
+        },
+        handler_);
     if (response == HandlerResponse::Close) {
       mark_for_closing(loop);
       return;
     }
-    if (response != HandlerResponse::NotRead && state_ == State::Active) {
+    if (response != HandlerResponse::NotRead && state_ == State::Active &&
+        !multishot_enable) {
       start_reading(loop);
     }
   }
 
   void start_reading(LoopType &loop);
 
-  void send_data(LoopType &loop, std::span<const std::byte> data) noexcept {
-    write_buf_.append_range(data);
-    if (!is_writing_) {
-      is_writing_ = true;
+  void send_data(LoopType &loop, std::span<std::byte> data) noexcept {
+    if (data.empty()) {
+      return;
+    }
+
+    std::byte *full_block_ptr = data.data() - sizeof(BufferHeader);
+    auto *hdr = new (full_block_ptr)
+        BufferHeader{.next = nullptr,
+                     .size = static_cast<uint32_t>(data.size()),
+                     .offset = 0};
+
+    if (!write_tail_) {
+      write_head_ = write_tail_ = full_block_ptr;
+    } else {
+      reinterpret_cast<BufferHeader *>(write_tail_)->next = full_block_ptr;
+      write_tail_ = full_block_ptr;
+    }
+
+    if (write_head_ == full_block_ptr) {
       flush_write_queue(loop);
     }
+
+    // write_buf_.append_range(data);
+    // if (!is_writing_) {
+    //   is_writing_ = true;
+    //   flush_write_queue(loop);
+    // }
   }
 
   void on_cancel_completed(LoopType &loop, int res) noexcept {
@@ -100,12 +140,25 @@ public:
       mark_for_closing(loop);
       return;
     }
-    bytes_sent_ += res;
-    if (bytes_sent_ == write_buf_.size()) {
-      bytes_sent_ = 0;
-      write_buf_.clear();
-      is_writing_ = false;
-    } else {
+    if (!write_head_) {
+      return;
+    }
+
+    auto *hdr = reinterpret_cast<BufferHeader *>(write_head_);
+    hdr->offset += res;
+
+    if (hdr->offset >= hdr->size) {
+      std::byte *old_head = write_head_;
+
+      write_head_ = hdr->next;
+      if (!write_head_) {
+        write_tail_ = nullptr;
+      }
+
+      pool_buffer_.deallocate(old_head);
+    }
+
+    if (write_head_) {
       flush_write_queue(loop);
     }
   }
@@ -124,11 +177,22 @@ public:
   }
 
   void flush_write_queue(LoopType &loop) noexcept {
-    std::span<const std::byte> remaining(write_buf_.data() + bytes_sent_,
-                                         write_buf_.size() - bytes_sent_);
+    auto *hdr = reinterpret_cast<BufferHeader *>(write_head_);
+
+    const std::byte *send_ptr =
+        write_head_ + sizeof(BufferHeader) + hdr->offset;
+    std::size_t bytes_left = hdr->size - hdr->offset;
+
+    std::span<const std::byte> remaining(send_ptr, bytes_left);
+
     ++pending_io_count_;
-    loop.submit_write(this, remaining);
+    loop.submit_send(this, remaining);
   };
+
+  std::span<std::byte> prepare_buffer() {
+    auto block = pool_buffer_.allocate();
+    return block.subspan(sizeof(BufferHeader));
+  }
 
 private:
 };

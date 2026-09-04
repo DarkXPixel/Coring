@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <charconv>
 #include <cstdint>
@@ -35,18 +36,16 @@ public:
     HttpMethod method{HttpMethod::UNKNOWN};
     std::string_view path;
     std::string_view version;
-    std::vector<HttpHeader> headers;
+    std::array<HttpHeader, 32> headers;
     BodyType body_type{BodyType::None};
 
     std::size_t content_length{0};
+    uint8_t header_counter{0};
 
     std::optional<std::string_view> get(std::string_view name) const {
       for (const auto &[h_name, h_value] : headers) {
         if (std::ranges::equal(h_name, name, [](char a, char b) {
-              auto to_lower = [](char c) {
-                return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
-              };
-              return to_lower(a) == to_lower(b);
+              return std::tolower(a) == std::tolower(b);
             })) {
           return h_value;
         }
@@ -141,8 +140,9 @@ private:
 
   static bool parse_header(std::string_view line, HttpRequestHead &head) {
     auto colon = line.find(':');
-    if (colon == std::string_view::npos)
+    if (colon == std::string_view::npos) {
       return false;
+    }
 
     std::string_view name = line.substr(0, colon);
     std::string_view value = line.substr(colon + 1);
@@ -157,10 +157,11 @@ private:
 
     name = trim(name);
     value = trim(value);
-    if (name.empty())
+    if (name.empty()) {
       return false;
+    }
 
-    head.headers.push_back({.name = name, .value = value});
+    head.headers[head.header_counter++] = {.name = name, .value = value};
     return true;
   }
 };

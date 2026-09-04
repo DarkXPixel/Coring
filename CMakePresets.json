@@ -25,6 +25,18 @@
                 "CMAKE_CXX_COMPILER": "/usr/bin/g++",
                 "CMAKE_BUILD_TYPE": "Release"
             }
+        },
+        {
+            "name": "g16-release-with-dbg",
+            "displayName": "GCC 16.0.1 x86_64-linux-gnu-rel-with-dbg",
+            "description": "Using compilers: C = /usr/bin/gcc-16, CXX = /usr/bin/g++-16",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+                "CMAKE_C_COMPILER": "/usr/bin/gcc",
+                "CMAKE_CXX_COMPILER": "/usr/bin/g++",
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+            }
         }
     ]
 }

@@ -1,5 +1,6 @@
 #pragma once
 #include "coring2/utility.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <format>
 #include <iterator>
@@ -78,6 +79,62 @@ public:
       response.append(body_.data(), body_.size());
     }
     return response;
+  }
+
+  [[nodiscard]] std::span<std::byte>
+  build_to(std::span<std::byte> buffer) const {
+    std::byte *ptr = buffer.data();
+    size_t remaining = buffer.size();
+
+    auto write_fmt = [&]<typename... Args>(std::format_string<Args...> fmt,
+                                           Args &&...args) -> bool {
+      auto result = std::format_to_n(reinterpret_cast<char *>(ptr), remaining,
+                                     fmt, std::forward<Args>(args)...);
+      if (static_cast<size_t>(result.size) > remaining) {
+        return false;
+      }
+      ptr += result.size;
+      remaining -= result.size;
+      return true;
+    };
+
+    auto write_raw = [&](std::string_view str) -> bool {
+      if (str.size() > remaining) {
+        return false;
+      }
+      std::copy_n(str.data(), str.size(), reinterpret_cast<char *>(ptr));
+      ptr += str.size();
+      remaining -= str.size();
+      return true;
+    };
+
+    if (!write_fmt("HTTP/1.1 {} {}\r\n", status_code_, status_message_)) {
+      return {};
+    }
+
+    for (const auto &[name, value] : headers_) {
+      if (!write_fmt("{}: {}\r\n", name, value)) {
+        return {};
+      }
+    }
+
+    if (auto_content_length_) {
+      if (!write_fmt("Content-Length: {}\r\n", body_.size())) {
+        return {};
+      }
+    }
+
+    if (!write_raw("\r\n")) {
+      return {};
+    }
+
+    if (!body_.empty()) {
+      if (!write_raw(body_)) {
+        return {};
+      }
+    }
+
+    return {buffer.data(), static_cast<std::size_t>(ptr - buffer.data())};
   }
 };
 } // namespace Coring2

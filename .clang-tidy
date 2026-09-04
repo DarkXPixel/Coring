@@ -1,0 +1,35 @@
+---
+Checks: >
+  -*,
+  bugprone-*,
+  performance-*,
+  readability-*,
+  modernize-*,
+  -modernize-use-trailing-return-type,
+  readability-magic-numbers
+  -bugprone-easily-swappable-parameters
+
+WarningsAsErrors: ''
+
+CheckOptions:
+  # 1. Список игнорируемых целых чисел (через запятую или точку с запятой)
+  - key:   readability-magic-numbers.IgnoredIntegerValues
+    value: "0;1;2;10;100;512;1024;4096"
+
+  # 2. Список игнорируемых чисел с плавающей точкой
+  - key:   readability-magic-numbers.IgnoredFloatingPointValues
+    value: "0.0;1.0;0.5"
+
+  # 3. Игнорировать ли магия-числа в перечислениях (enum) (по умолчанию: true)
+  - key:   readability-magic-numbers.IgnoreEnums
+    value: "true"
+
+  # 4. Игнорировать ли числа в типах c битовыми полями (по умолчанию: true)
+  - key:   readability-magic-numbers.IgnoreBitFieldsWidths
+    value: "true"
+
+  # 5. Игнорировать ли числа во всем, кроме макросов и переменных (по умолчанию: false)
+  - key:   readability-magic-numbers.IgnorePowersOfTwoIntegerValues
+    value: "false"
+  - key:   readability-magic-numbers.IgnorePowersOfTwoIntegerValues
+    value: "true"
