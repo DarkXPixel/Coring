@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EmptySession.hpp"
+#include "coring3/BufferHandle.hpp"
 #include "coring3/DenseStreamMap.hpp"
 #include "coring3/SessionStorage.hpp"
 #include <array>
@@ -14,23 +15,28 @@ public:
   std::array<std::byte, 24> peek_buf{};
   size_t bytes_read{0};
 };
-class Http1ClientSession {
+class alignas(64) Http1ClientSession {
 public:
-  int fd{-1};
-
-  // BufferHandle rx_buffer;
-  // BufferHandle tx_buffer;
   SessionHandle active_stream_handle{};
+  int32_t fd{-1};
+  uint32_t flags{0};
+  uint16_t pending_rx_offset{0};
+  uint16_t partial_rx_bytes{0};
 
-  bool keep_alive{true};
-  bool reading_body{false};
+  BufferHandle partial_rx_accumulator;
 };
 
 class Http2ClientSession {
 public:
-  int fd{-1};
-  // BufferHandle rx_buffer;
-  // BufferHandle tx_buffer;
+  int32_t fd{-1};
+
+  // HPackDecoder
+
+  enum class FrameParserState : uint8_t {
+    ReadHeader,
+    ReadPayload,
+    SkipPayload
+  } parserState{FrameParserState::ReadHeader};
 
   uint32_t last_client_stream_id{0};
   uint32_t local_window_size{65535};

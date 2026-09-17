@@ -5,8 +5,10 @@
 #include <cstdlib>
 #include <liburing.h>
 #include <liburing/io_uring.h>
+#include <span>
 namespace Coring3 {
 class ProvidedBufferPool {
+public:
   static constexpr uint16_t BGID_CLIENT_RX = 1;
   static constexpr std::size_t BUF_SIZE = 4096;
   static constexpr std::size_t NUM_BUFFERS = 1024;
@@ -56,6 +58,17 @@ public:
 
     io_uring_buf_ring_advance(buf_ring_, static_cast<int>(num_bufs));
     return true;
+  }
+
+  [[nodiscard]] std::span<std::byte>
+  get_buffer(uint16_t bid, uint32_t bytes_read) const noexcept {
+    return {buffer_base + (bid * BUF_SIZE), bytes_read};
+  }
+
+  void recycle_buffer(uint16_t bid) noexcept {
+    io_uring_buf_ring_add(buf_ring_, buffer_base + (bid * BUF_SIZE), BUF_SIZE,
+                          bid, io_uring_buf_ring_mask(NUM_BUFFERS), 0);
+    io_uring_buf_ring_advance(buf_ring_, 1);
   }
 };
 } // namespace Coring3

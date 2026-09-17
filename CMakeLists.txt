@@ -8,9 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 
+
 find_package(PkgConfig REQUIRED)
 
-pkg_check_modules(LIBURING REQUIRED liburing)
+pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
 add_compile_options(-g)
 add_compile_options(-fno-omit-frame-pointer)
@@ -27,8 +28,13 @@ add_executable(exe src/main.cpp
     src/coring3/ThreadWorker.cpp)
 
 
-target_include_directories(exe PRIVATE ${LIBURING_INCLUDE_DIRS})
-target_link_directories(exe PRIVATE ${LIBURING_LIBRARY_DIRS})
-target_link_libraries(exe PRIVATE ${LIBURING_LIBRARIES})
+# target_include_directories(exe PRIVATE ${LIBURING_INCLUDE_DIRS})
+# target_link_directories(exe PRIVATE ${LIBURING_LIBRARY_DIRS})
+# target_link_libraries(exe PUBLIC picohttpparser)
+# target_link_libraries(exe PRIVATE ${LIBURING_LIBRARIES})
+
+target_link_libraries(exe PRIVATE 
+    PkgConfig::LIBURING
+)
 
 target_include_directories(exe PRIVATE include)

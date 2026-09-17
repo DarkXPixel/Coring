@@ -2,6 +2,7 @@
 
 #include "SessionStorage.hpp"
 #include "coring3/ComplectionKind.hpp"
+#include "coring3/ProvidedBufferPool.hpp"
 #include "coring3/Sessions.hpp"
 #include "coring3/Stream.hpp"
 #include "coring3/UserData.hpp"
@@ -33,6 +34,8 @@ public:
       throw std::system_error(-ret, std::generic_category(),
                               "Failed to init io_uring");
     }
+    rx_buf_pool.init(&ring_, rx_buf_pool.BGID_CLIENT_RX,
+                     rx_buf_pool.NUM_BUFFERS);
   }
 
   ~ThreadWorker() { io_uring_queue_exit(&ring_); }
@@ -98,13 +101,25 @@ public:
   void on_accept(int client_fd) noexcept;
   void on_client_read(SessionHandle conn_handle,
                       ClientConnectionVariant &conn_var,
-                      int bytes_read) noexcept;
+                      io_uring_cqe *cqe) noexcept;
 
   void arm_detecting_recv(SessionHandle conn_handle,
                           DetectionSession &conn_var);
 
   void promote_to_http1(SessionHandle conn_handle,
                         DetectionSession &detecting) noexcept;
+
+  void promote_to_http2(SessionHandle conn_handle,
+                        DetectionSession &detectiong) noexcept;
+
+  void arm_client_recv_provided(SessionHandle handle, int fd) noexcept;
+
+  void close_client_connection(SessionHandle handle,
+                               ClientConnectionVariant &conn_var) noexcept;
+
+  void process_http1_data(SessionHandle conn_handle,
+                          Http1ClientSession &session,
+                          std::span<const std::byte> rx_data) noexcept;
 
 private:
   io_uring ring_;
@@ -115,6 +130,7 @@ private:
   SessionStorage<UpstreamConnectionVariant, 100000> upstream_conns_;
   SessionStorage<StreamVariant, 50000> streams_;
 
+  ProvidedBufferPool rx_buf_pool;
   // SessionStorage<Connection>
   std::unordered_map<int, uint16_t> listeners_;
   static constexpr uint64_t MULTISHOT_ACCEPT_USER_DATA = 0xDEADBEEF;
