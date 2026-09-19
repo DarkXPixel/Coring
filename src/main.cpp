@@ -22,7 +22,7 @@ int main(int argc, char *argv[]) {
   }
   shutdown_requested.wait(false);
 
-  th->get()->stop();
+  // th->get()->stop();
 
   return 0;
 }

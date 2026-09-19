@@ -3,6 +3,7 @@
 #include "coring4/Engine.hpp"
 #include <condition_variable>
 #include <expected>
+#include <future>
 #include <liburing.h>
 #include <liburing/io_uring.h>
 #include <memory>
@@ -14,9 +15,8 @@
 namespace Coring4 {
 class ThreadWorker {
 private:
-  std::jthread worker_thread_;
-  bool running_{true};
   std::unique_ptr<Engine> engine_;
+  std::jthread worker_thread_;
 
   ThreadWorker() = default;
 
@@ -25,15 +25,17 @@ public:
   createAndStart() {
     struct Enabler : public ThreadWorker {};
     auto worker = std::make_unique<Enabler>();
-    auto mb_engine = Engine::create();
-    if (!mb_engine) {
-      return std::unexpected("Create engine failed");
+
+    std::promise<std::expected<void, std::string>> init_promise;
+    auto init_future = init_promise.get_future();
+
+    if (auto res = worker->start(std::move(init_promise)); !res) {
+      return std::unexpected(res.error());
     }
 
-    worker->engine_ = std::move(*mb_engine);
-
-    if (auto res = worker->start(); !res) {
-      return std::unexpected(res.error());
+    auto init_result = init_future.get();
+    if (!init_result) {
+      return std::unexpected(init_result.error());
     }
 
     return worker;
@@ -41,22 +43,29 @@ public:
 
   ~ThreadWorker() { stop(); }
 
-  void stop() {
-    if (running_) {
-      worker_thread_.request_stop();
-    }
-  }
+  void stop() { worker_thread_.request_stop(); }
 
 private:
-  void run(const std::stop_token &stoken) {
-    engine_->run(stoken);
-    running_ = false;
-  }
+  void run(std::stop_token stoken) { engine_->run(stoken); }
 
-  std::expected<void, std::string> start() {
+  std::expected<void, std::string>
+  start(std::promise<std::expected<void, std::string>> init_promise) {
     try {
       worker_thread_ = std::jthread(
-          [this](const std::stop_token &stoken) { this->run(stoken); });
+          [this](const std::stop_token &stoken,
+                 std::promise<std::expected<void, std::string>> init_promise) {
+            auto mb_engine = Engine::create();
+            if (!mb_engine) {
+              std::println("Create engine failed");
+              init_promise.set_value(std::unexpected(mb_engine.error()));
+              return;
+            }
+
+            this->engine_ = std::move(*mb_engine);
+            init_promise.set_value({});
+            this->run(stoken);
+          },
+          std::move(init_promise));
     } catch (...) {
       return std::unexpected("Thread start failed");
     }

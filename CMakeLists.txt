@@ -10,6 +10,7 @@ set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 
 find_package(PkgConfig REQUIRED)
+find_package(Boost REQUIRED)
 
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
@@ -34,7 +35,7 @@ add_executable(exe src/main.cpp
 # target_link_libraries(exe PRIVATE ${LIBURING_LIBRARIES})
 
 target_link_libraries(exe PRIVATE 
-    PkgConfig::LIBURING
+    PkgConfig::LIBURING Boost::boost
 )
 
 target_include_directories(exe PRIVATE include)
