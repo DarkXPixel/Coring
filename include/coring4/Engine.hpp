@@ -111,6 +111,7 @@ public:
       int ret = io_uring_submit_and_wait(&ring_, 1);
 
       if (ret < 0) {
+        std::println("Error {}", ret);
         if (ret == -EINTR) {
           continue;
         }

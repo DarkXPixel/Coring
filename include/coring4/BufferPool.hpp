@@ -33,6 +33,11 @@ public:
     grow(initial_capacity);
   }
 
+  ~LocalBufferPool() {
+    for (auto &i : chunks_) {
+      ::operator delete[](i, std::align_val_t{alignof(std::max_align_t)});
+    }
+  }
   [[nodiscard]] auto allocate() {
     if (free_list_ == nullptr) {
       if constexpr (BlockSize <= std::numeric_limits<uint16_t>::max()) {
