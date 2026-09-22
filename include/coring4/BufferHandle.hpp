@@ -4,15 +4,18 @@
 #include <cstdint>
 #include <span>
 namespace Coring4 {
+
 class BufferHandle16 {
   static constexpr uint32_t IS_PROVIDED_BUFFER = 1;
 
-  std::byte *ptr_{nullptr};
-  uint16_t size_{0};
-  uint16_t offset_{0};
+  union {
+    std::byte *ptr_{nullptr};
+    const char *t;
+  };
+  uint32_t size_{0};
   int8_t pool_id_{-1};
 
-  uint32_t flags_ : 24;
+  // uint32_t flags_ : 8;
 
 public:
   BufferHandle16() = default;
@@ -22,13 +25,12 @@ public:
   BufferHandle16 &operator=(const BufferHandle16 &) = default;
 
   [[nodiscard]] std::span<std::byte> as_span() const noexcept {
-    return {ptr_ + offset_, static_cast<std::size_t>(size_ - offset_)};
+    return {ptr_, static_cast<std::size_t>(size_)};
   }
 
   [[nodiscard]] uint16_t size() const noexcept { return size_; }
-  [[nodiscard]] uint16_t offset() const noexcept { return offset_; }
 
-  void move_offset(int32_t offset) noexcept { offset_ += offset; }
+  void set_size(uint32_t size) noexcept { size_ = size; }
 
   [[nodiscard]] std::span<std::byte> as_raw_span() const noexcept {
     return {ptr_, size_};
@@ -36,11 +38,15 @@ public:
 
   [[nodiscard]] std::byte *as_raw() const noexcept { return ptr_; }
 
+  [[nodiscard]] std::byte *data() const noexcept { return ptr_; }
+
   [[nodiscard]] bool is_valid() const noexcept { return ptr_ != nullptr; }
 
-  void set_is_provided() noexcept { flags_ |= IS_PROVIDED_BUFFER; }
-  [[nodiscard]] bool is_provided() const noexcept {
-    return (flags_ & IS_PROVIDED_BUFFER);
-  }
+  int8_t get_pool_id() const noexcept { return pool_id_; }
+
+  // void set_is_provided() noexcept { flags_ |= IS_PROVIDED_BUFFER; }
+  // [[nodiscard]] bool is_provided() const noexcept {
+  //   return (flags_ & IS_PROVIDED_BUFFER);
+  // }
 };
 } // namespace Coring4

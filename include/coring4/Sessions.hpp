@@ -1,6 +1,9 @@
 #pragma once
 #include "SessionStorage.hpp"
 #include "coring4/BufferHandle.hpp"
+#include "coring4/EgressQueue.hpp"
+#include "coring4/LocalIndexQueue.hpp"
+#include <cstdint>
 #include <variant>
 
 namespace Coring4 {
@@ -16,8 +19,9 @@ struct Http1ClientSession {
 
 struct TestClientSession {
   int fd{-1};
-  BufferHandle16 write_handle;
-  uint8_t bgid{0};
+  EgressQueue *egress_queue{nullptr};
+  bool recv_paused{false};
+  // BufferHandle16 write_handle;
 };
 
 struct Http1UpstreamSession {

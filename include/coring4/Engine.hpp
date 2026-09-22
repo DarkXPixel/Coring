@@ -2,10 +2,12 @@
 
 #include "coring4/BufferHandle.hpp"
 #include "coring4/BufferPool.hpp"
+#include "coring4/EgressQueue.hpp"
 #include "coring4/Listener.hpp"
 #include "coring4/ProvidedBufferPool.hpp"
 #include "coring4/SessionStorage.hpp"
 #include "coring4/Sessions.hpp"
+#include "coring4/ThreadLocalSlabPool.hpp"
 #include <algorithm>
 #include <array>
 #include <asm-generic/socket.h>
@@ -17,6 +19,7 @@
 #include <cstdint>
 #include <exception>
 #include <expected>
+#include <functional>
 #include <liburing.h>
 #include <liburing/io_uring.h>
 #include <memory>
@@ -48,17 +51,23 @@ private:
   LocalBufferPool<> buffer_pool{0, 8192};
 
   ProvidedBufferPool<> provided_ring_pool_;
+  ThreadLocalSlabPool<EgressQueue, 8192> egress_pool;
+  ThreadLocalSlabPool<StackRingBuffer<PendingChunk, 32>, 16> ring_chunks_pool;
 
   uint16_t need_to_push_ring_pool{0};
 
+  bool is_running_{true};
+
   // boost::container::small_vector<class T, std::size_t N>//TEMP
 
-  enum class OpCode : uint8_t { Accept = 0, Send, Recv };
+  enum class OpCode : uint8_t { Accept = 0, Send, Recv, StopSignal, Close };
 
   struct UserData {
     uint32_t generation{0};
     uint32_t index : 24;
     OpCode op : 8;
+
+    operator uint64_t() const { return std::bit_cast<uint64_t>(*this); }
   };
 
   static_assert(sizeof(UserData) == 8);
@@ -92,21 +101,28 @@ public:
       engine->provided_ring_pool_.recycle_buffer(engine->buffer_pool.allocate(),
                                                  i);
     }
-    engine->provided_ring_pool_.advanace(ring_pool_size);
+    engine->provided_ring_pool_.advanace();
 
     engine->is_initialized_ = true;
     return engine;
   }
 
   void run(std::stop_token stoken) {
-    std::atomic<bool> running{true};
-    std::stop_callback stop_cb(stoken, [&running, this]() {
-      running.store(false, std::memory_order_relaxed);
+
+    int stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    auto *sqe = get_sqe();
+    uint64_t stop_buf;
+    io_uring_prep_read(sqe, stop_fd, &stop_buf, sizeof(stop_buf), 0);
+    io_uring_sqe_set_data64(sqe, UserData{.op = OpCode::StopSignal});
+
+    std::stop_callback stop_cb(stoken, [this, stop_fd]() {
+      uint64_t val = 1;
+      write(stop_fd, &val, sizeof(val));
     });
 
     auto _ = add_listener_tcp(8080);
-
-    while (running.load(std::memory_order_relaxed)) {
+    is_running_ = true;
+    while (is_running_) {
       io_uring_cqe *cqe{nullptr};
       int ret = io_uring_submit_and_wait(&ring_, 1);
 
@@ -127,10 +143,7 @@ public:
       }
 
       io_uring_cq_advance(&ring_, count);
-      if (this->need_to_push_ring_pool > 0) {
-        this->provided_ring_pool_.advanace(
-            std::exchange(need_to_push_ring_pool, 0));
-      }
+      this->provided_ring_pool_.advanace();
     }
 
     std::println("End loop");
@@ -147,6 +160,13 @@ public:
       break;
     case OpCode::Recv:
       process_recv(cqe);
+      break;
+    case OpCode::StopSignal:
+      is_running_ = false;
+      std::println("Stop signal");
+      break;
+    case OpCode::Close:
+      process_close(cqe);
       break;
     }
   }
@@ -180,7 +200,50 @@ private:
     io_uring_sqe_set_data64(sqe, std::bit_cast<uint64_t>(ud));
   }
 
+  void process_close(io_uring_cqe *cqe) {
+    if (cqe->user_data == 0) {
+      return;
+    }
+
+    auto ud = std::bit_cast<UserData>(cqe->user_data);
+    auto handle = SessionHandle{.index = ud.index, .generation = ud.generation};
+    auto *mb_conn =
+        connections_.get({.index = ud.index, .generation = ud.generation});
+    if (mb_conn == nullptr) {
+      return;
+    }
+
+    ClientConnectionVariant &conn = *mb_conn;
+    std::visit(
+        [cqe, this, handle](auto &conn) {
+          using T = std::decay_t<decltype(conn)>;
+
+          if constexpr (std::is_same_v<T, TestClientSession>) {
+            if (conn.egress_queue) {
+              conn.egress_queue->clear(ring_chunks_pool,
+                                       [this](const BufferHandle16 &h) {
+                                         if (h.get_pool_id() == 0) {
+                                           buffer_pool.deallocate(h);
+                                         }
+                                       });
+              egress_pool.deallocate(conn.egress_queue);
+              conn.egress_queue = nullptr;
+            }
+          }
+        },
+        conn);
+
+    connections_.release(handle);
+  }
+
   void process_recv(io_uring_cqe *cqe) {
+    static std::string test_http200 = "HTTP/1.1 200 OK\r\n"
+                                      "Content-Type: text/plain\r\n"
+                                      "Content-Length: 13\r\n"
+                                      "Connection: keep-alive\r\n"
+                                      "\r\n"
+                                      "Hello, World!";
+
     if (cqe->user_data == 0) {
       return;
     }
@@ -200,11 +263,14 @@ private:
 
           if constexpr (std::is_same_v<T, TestClientSession>) {
             if (cqe->res <= 0) {
-              ::close(conn.fd);
-              if (conn.write_handle.is_valid()) {
-                this->buffer_pool.deallocate(conn.write_handle);
+              if (cqe->res == -ECANCELED) {
+                return;
               }
-              this->connections_.release(handle);
+              io_uring_sqe *sqe = get_sqe();
+              io_uring_prep_close(sqe, conn.fd);
+              sqe->user_data = UserData{.generation = handle.generation,
+                                        .index = handle.index,
+                                        .op = OpCode::Close};
               return;
             }
 
@@ -214,25 +280,46 @@ private:
               const auto bid =
                   static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
 
-              auto handle_buf = this->provided_ring_pool_.get_by_bid(bid);
-              this->provided_ring_pool_.recycle_buffer(
-                  this->buffer_pool.allocate(), bid);
-              ++this->need_to_push_ring_pool;
+              BufferHandle16 handle_buf =
+                  this->provided_ring_pool_.get_by_bid(bid);
+              this->provided_ring_pool_.recycle_buffer(handle_buf, bid);
 
-              this->send_data(conn.fd, handle_buf, cqe->res, handle);
-              conn.write_handle = handle_buf;
+              std::span<std::byte> sp(
+                  reinterpret_cast<std::byte *>(
+                      const_cast<char *>(test_http200.data())),
+                  test_http200.size());
+              handle_buf = BufferHandle16(sp, 123);
+
+              // this->provided_ring_pool_.recycle_buffer(
+              //     this->buffer_pool.allocate(), bid);
+
+              // handle_buf.set_size(cqe->res);
+              PendingChunk testChunk;
+              testChunk.add_handle(handle_buf);
+              if (conn.egress_queue == nullptr) {
+                conn.egress_queue = egress_pool.allocate(conn.fd);
+              }
+              conn.recv_paused = conn.egress_queue->push(std::move(testChunk),
+                                                         ring_chunks_pool);
+              if (!conn.recv_paused) {
+                io_uring_sqe *sqe = get_sqe();
+                conn.egress_queue->prepare_send_sqe(sqe);
+                sqe->user_data = UserData{.generation = handle.generation,
+                                          .index = handle.index,
+                                          .op = OpCode::Send};
+              }
               return;
             }
           }
         },
         conn);
-    // const bool has_buffer = (cqe->flags & IORING_CQE_F_BUFFER) != 0;
-
-    // if (has_buffer) {
-    // } else {
-    //   ::close(conn);
-    // }
   }
+
+  // void flush_tx_queue(TestClientSession &session) {
+  //   while (auto buf_opt = session.tx_queue.peek()) {
+  //     auto &buf = *buf_opt;
+  //   }
+  // }
 
   void process_send(io_uring_cqe *cqe) {
     if (cqe->user_data == 0) {
@@ -254,30 +341,54 @@ private:
 
           if constexpr (std::is_same_v<T, TestClientSession>) {
             if (cqe->res <= 0) {
-              this->buffer_pool.deallocate(conn.write_handle);
-              ::close(conn.fd);
-              this->connections_.release(handle);
+              io_uring_sqe *sqe = get_sqe();
+              io_uring_prep_close(sqe, conn.fd);
+              sqe->user_data = UserData{.generation = handle.generation,
+                                        .index = handle.index,
+                                        .op = OpCode::Close};
+              return;
             }
-            this->buffer_pool.deallocate(conn.write_handle);
-            conn.write_handle = {};
-            auto *sqe = get_sqe();
-            io_uring_prep_recv(sqe, conn.fd, nullptr, 0, 0);
-            sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_IO_LINK;
-            sqe->buf_group = provided_ring_pool_.get_bgid();
-            UserData ud{.generation = handle.generation,
-                        .index = handle.index,
-                        .op = OpCode::Recv};
-            io_uring_sqe_set_data64(sqe, std::bit_cast<uint64_t>(ud));
+
+            if (bool low_watermark = conn.egress_queue->on_send_complete(
+                    cqe->res, ring_chunks_pool,
+                    [this](const BufferHandle16 &h) {
+                      if (h.get_pool_id() == 0) {
+                        buffer_pool.deallocate(h);
+                      }
+                    });
+                conn.recv_paused && low_watermark) {
+              conn.recv_paused = false;
+            }
+            if (conn.egress_queue->empty()) {
+              egress_pool.deallocate(conn.egress_queue);
+              conn.egress_queue = nullptr;
+            } else {
+              io_uring_sqe *sqe = get_sqe();
+              conn.egress_queue->prepare_send_sqe(sqe);
+              sqe->user_data = UserData{.generation = handle.generation,
+                                        .index = handle.index,
+                                        .op = OpCode::Send};
+            }
+            if (!conn.recv_paused) {
+              auto *sqe = get_sqe();
+              io_uring_prep_recv(sqe, conn.fd, nullptr, 0, 0);
+              sqe->flags |= IOSQE_BUFFER_SELECT;
+              sqe->buf_group = provided_ring_pool_.get_bgid();
+              UserData ud{.generation = handle.generation,
+                          .index = handle.index,
+                          .op = OpCode::Recv};
+              io_uring_sqe_set_data64(sqe, ud);
+            }
             return;
           }
         },
         conn);
   }
 
-  void send_data(int fd, BufferHandle16 handle_data, std::size_t size,
+  void send_data(int fd, BufferHandle16 handle_data,
                  SessionHandle handle) noexcept {
     auto *sqe = get_sqe();
-    io_uring_prep_send(sqe, fd, handle_data.as_raw(), size, 0);
+    io_uring_prep_send(sqe, fd, handle_data.data(), handle_data.size(), 0);
 
     io_uring_sqe_set_data64(
         sqe, std::bit_cast<uint64_t>(UserData{.generation = handle.generation,

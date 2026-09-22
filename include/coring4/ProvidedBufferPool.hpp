@@ -7,18 +7,21 @@
 #include <liburing.h>
 #include <liburing/io_uring.h>
 #include <span>
+#include <utility>
 #include <vector>
 namespace Coring4 {
 template <std::size_t BUF_SIZE = 16384> class ProvidedBufferPool {
 public:
-  static constexpr std::size_t NUM_BUFFERS = 1024;
+  // static constexpr std::size_t NUM_BUFFERS = 1024;
+  // static constexpr auto RING_MASK = NUM_BUFFERS - 1;
 
 private:
+  std::vector<BufferHandle16> pool_bufs_; // temp
   io_uring_buf_ring *buf_ring_{nullptr};
   std::size_t ring_size_bytes_{0};
   uint16_t bgid_{0};
+  uint16_t recycle_count_{0};
 
-  std::vector<BufferHandle16> pool_bufs_; // temp
 public:
   ProvidedBufferPool() noexcept = default;
 
@@ -50,16 +53,18 @@ public:
 
   void recycle_buffer(BufferHandle16 handle, uint16_t bid) noexcept {
     pool_bufs_[bid] = handle;
-    io_uring_buf_ring_add(buf_ring_, handle.as_raw(), BUF_SIZE, bid,
-                          io_uring_buf_ring_mask(NUM_BUFFERS), bid);
+    io_uring_buf_ring_add(buf_ring_, handle.as_raw(), pool_bufs_.size(), bid,
+                          io_uring_buf_ring_mask(pool_bufs_.size()),
+                          recycle_count_++);
+  }
+  void advanace() noexcept {
+    if (recycle_count_ > 0) {
+      io_uring_buf_ring_advance(buf_ring_, std::exchange(recycle_count_, 0));
+    }
   }
 
   BufferHandle16 get_by_bid(uint16_t bid) noexcept { return pool_bufs_[bid]; }
 
   auto get_bgid() const noexcept { return bgid_; }
-
-  void advanace(int count) noexcept {
-    io_uring_buf_ring_advance(buf_ring_, count);
-  }
 };
 } // namespace Coring4

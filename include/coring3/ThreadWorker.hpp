@@ -95,7 +95,7 @@ public:
     const auto op = static_cast<ComplectionKind>(ud.op_code);
     const SessionHandle handle{.index = ud.index, .generation = ud.generation};
 
-    switch (op) { case ComplectionKind::Accept: }
+    // switch (op) { case ComplectionKind::Accept: }
   }
 
   void on_accept(int client_fd) noexcept;

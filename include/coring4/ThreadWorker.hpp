@@ -7,7 +7,10 @@
 #include <liburing.h>
 #include <liburing/io_uring.h>
 #include <memory>
+#include <optional>
 #include <print>
+#include <pthread.h>
+#include <sched.h>
 #include <semaphore>
 #include <stop_token>
 #include <thread>
@@ -22,14 +25,14 @@ private:
 
 public:
   static std::expected<std::unique_ptr<ThreadWorker>, std::string>
-  createAndStart() {
+  createAndStart(std::optional<uint32_t> th_id = std::nullopt) {
     struct Enabler : public ThreadWorker {};
     auto worker = std::make_unique<Enabler>();
 
     std::promise<std::expected<void, std::string>> init_promise;
     auto init_future = init_promise.get_future();
 
-    if (auto res = worker->start(std::move(init_promise)); !res) {
+    if (auto res = worker->start(std::move(init_promise), th_id); !res) {
       return std::unexpected(res.error());
     }
 
@@ -49,11 +52,20 @@ private:
   void run(std::stop_token stoken) { engine_->run(stoken); }
 
   std::expected<void, std::string>
-  start(std::promise<std::expected<void, std::string>> init_promise) {
+  start(std::promise<std::expected<void, std::string>> init_promise,
+        std::optional<uint32_t> th_index) {
     try {
       worker_thread_ = std::jthread(
-          [this](const std::stop_token &stoken,
-                 std::promise<std::expected<void, std::string>> init_promise) {
+          [this, th_index](
+              const std::stop_token &stoken,
+              std::promise<std::expected<void, std::string>> init_promise) {
+            if (th_index) {
+              cpu_set_t cpuset;
+              CPU_ZERO(&cpuset);
+              CPU_SET(*th_index, &cpuset);
+
+              pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+            }
             auto mb_engine = Engine::create();
             if (!mb_engine) {
               std::println("Create engine failed");
