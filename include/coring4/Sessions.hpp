@@ -21,6 +21,7 @@ struct TestClientSession {
   int fd{-1};
   EgressQueue *egress_queue{nullptr};
   bool recv_paused{false};
+  bool multishot_recv{false};
   // BufferHandle16 write_handle;
 };
 

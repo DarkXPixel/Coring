@@ -61,7 +61,10 @@ public:
                  sizeof(yes_opt));
 
     if (protocol == Protocol::Tcp) {
-      ::setsockopt(listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &yes_opt,
+      int timeout_sec = 3;
+      ::setsockopt(listen_fd, IPPROTO_TCP, TCP_DEFER_ACCEPT, &timeout_sec,
+                   sizeof(timeout_sec));
+      ::setsockopt(listen_fd, IPPROTO_TCP, TCP_NODELAY, &yes_opt,
                    sizeof(yes_opt));
     }
 

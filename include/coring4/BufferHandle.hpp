@@ -1,5 +1,6 @@
 #pragma once
 
+#include "coring4/PoolType.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -13,13 +14,13 @@ class BufferHandle16 {
     const char *t;
   };
   uint32_t size_{0};
-  int8_t pool_id_{-1};
+  PoolType pool_id_{-1};
 
   // uint32_t flags_ : 8;
 
 public:
   BufferHandle16() = default;
-  BufferHandle16(std::span<std::byte> buf, int8_t pool_id)
+  BufferHandle16(std::span<std::byte> buf, PoolType pool_id)
       : pool_id_(pool_id), ptr_(buf.data()), size_(buf.size()) {}
   BufferHandle16(const BufferHandle16 &) = default;
   BufferHandle16 &operator=(const BufferHandle16 &) = default;
@@ -42,7 +43,7 @@ public:
 
   [[nodiscard]] bool is_valid() const noexcept { return ptr_ != nullptr; }
 
-  int8_t get_pool_id() const noexcept { return pool_id_; }
+  [[nodiscard]] PoolType get_pool_id() const noexcept { return pool_id_; }
 
   // void set_is_provided() noexcept { flags_ |= IS_PROVIDED_BUFFER; }
   // [[nodiscard]] bool is_provided() const noexcept {

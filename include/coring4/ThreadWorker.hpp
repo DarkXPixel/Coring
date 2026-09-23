@@ -1,6 +1,7 @@
 #pragma once
 
 #include "coring4/Engine.hpp"
+#include "coring4/ManageService.hpp"
 #include <condition_variable>
 #include <expected>
 #include <future>
@@ -47,6 +48,10 @@ public:
   ~ThreadWorker() { stop(); }
 
   void stop() { worker_thread_.request_stop(); }
+
+  std::shared_ptr<Manage::WorkerChannel> get_channel() {
+    return engine_->create_or_get_worker_channel();
+  }
 
 private:
   void run(std::stop_token stoken) { engine_->run(stoken); }

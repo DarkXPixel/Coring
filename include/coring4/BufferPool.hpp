@@ -25,10 +25,10 @@ class LocalBufferPool {
   std::vector<std::byte *> chunks_; // temp
   std::size_t capacity{0};
   std::size_t available_buffers_{0};
-  int8_t pool_id_{-1};
+  PoolType pool_id_{-1};
 
 public:
-  LocalBufferPool(int8_t pool_id, std::size_t initial_capacity = 1024)
+  LocalBufferPool(PoolType pool_id, std::size_t initial_capacity = 1024)
       : pool_id_(pool_id) {
     grow(initial_capacity);
   }

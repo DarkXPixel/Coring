@@ -4,6 +4,8 @@
 #include "coring4/BufferPool.hpp"
 #include "coring4/EgressQueue.hpp"
 #include "coring4/Listener.hpp"
+#include "coring4/ManageService.hpp"
+#include "coring4/PoolType.hpp"
 #include "coring4/ProvidedBufferPool.hpp"
 #include "coring4/SessionStorage.hpp"
 #include "coring4/Sessions.hpp"
@@ -36,7 +38,6 @@
 #include <variant>
 #include <vector>
 namespace Coring4 {
-
 class Engine {
 private:
   static constexpr auto RING_ENTRIES_COUNT = 4096;
@@ -48,7 +49,7 @@ private:
 
   SessionStorage<ClientConnectionVariant> connections_;
 
-  LocalBufferPool<> buffer_pool{0, 8192};
+  LocalBufferPool<> default_pool_16kb{PoolType::DefaultPool16KB, 8192};
 
   ProvidedBufferPool<> provided_ring_pool_;
   ThreadLocalSlabPool<EgressQueue, 8192> egress_pool;
@@ -58,14 +59,32 @@ private:
 
   bool is_running_{true};
 
+  uint64_t buf_for_singnal;
+  std::shared_ptr<Manage::WorkerChannel> channel_;
+
   // boost::container::small_vector<class T, std::size_t N>//TEMP
 
-  enum class OpCode : uint8_t { Accept = 0, Send, Recv, StopSignal, Close };
+  enum class OpCode : uint8_t {
+    Accept = 0,
+    Send,
+    Recv,
+    StopSignal,
+    Close,
+    Connect,
+    Read,
+    Write,
+    ManageSignal
+  };
 
   struct UserData {
     uint32_t generation{0};
     uint32_t index : 24;
     OpCode op : 8;
+
+    static UserData create(SessionHandle handle, OpCode op) {
+      return UserData{
+          .generation = handle.generation, .index = handle.index, .op = op};
+    }
 
     operator uint64_t() const { return std::bit_cast<uint64_t>(*this); }
   };
@@ -80,6 +99,16 @@ public:
   Engine &operator=(Engine &&) = delete;
 
   ~Engine() { cleanup(); }
+
+  [[maybe_unused]] std::shared_ptr<Manage::WorkerChannel>
+  create_or_get_worker_channel() {
+    if (channel_) {
+      return channel_;
+    }
+    channel_ = std::make_shared<Manage::WorkerChannel>();
+    channel_->ev_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    return channel_;
+  }
 
   static std::expected<std::unique_ptr<Engine>, std::string> create() {
     auto engine = std::make_unique<Engine>();
@@ -98,29 +127,40 @@ public:
       return std::unexpected("Failed to init provided ring pool");
     }
     for (int i = 0; i < ring_pool_size; ++i) {
-      engine->provided_ring_pool_.recycle_buffer(engine->buffer_pool.allocate(),
-                                                 i);
+      engine->provided_ring_pool_.recycle_buffer(
+          engine->default_pool_16kb.allocate(), i);
     }
     engine->provided_ring_pool_.advanace();
-
+    engine->create_or_get_worker_channel();
     engine->is_initialized_ = true;
     return engine;
+  }
+
+  void recv_manage_singnal() noexcept {
+    auto *sqe = get_sqe();
+    io_uring_prep_read(sqe, channel_->ev_fd, &buf_for_singnal,
+                       sizeof(buf_for_singnal), 0);
+    sqe->user_data = UserData{.op = OpCode::ManageSignal};
   }
 
   void run(std::stop_token stoken) {
 
     int stop_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    auto *sqe = get_sqe();
-    uint64_t stop_buf;
-    io_uring_prep_read(sqe, stop_fd, &stop_buf, sizeof(stop_buf), 0);
-    io_uring_sqe_set_data64(sqe, UserData{.op = OpCode::StopSignal});
+    {
+      auto *sqe = get_sqe();
+      io_uring_prep_read(sqe, stop_fd, &buf_for_singnal,
+                         sizeof(buf_for_singnal), 0);
+      io_uring_sqe_set_data64(sqe, UserData{.op = OpCode::StopSignal});
+    }
+
+    recv_manage_singnal();
 
     std::stop_callback stop_cb(stoken, [this, stop_fd]() {
       uint64_t val = 1;
       write(stop_fd, &val, sizeof(val));
     });
 
-    auto _ = add_listener_tcp(8080);
+    // auto _ = add_listener(8080);
     is_running_ = true;
     while (is_running_) {
       io_uring_cqe *cqe{nullptr};
@@ -149,6 +189,9 @@ public:
     std::println("End loop");
   }
 
+  template <typename T>
+  void process_cqe_t(io_uring_cqe *cqe, SessionHandle session_handle, T &Conn);
+
   void process_cqe(io_uring_cqe *cqe) {
     const auto ud = std::bit_cast<UserData>(cqe->user_data);
     switch (ud.op) {
@@ -168,6 +211,9 @@ public:
     case OpCode::Close:
       process_close(cqe);
       break;
+    case OpCode::ManageSignal:
+      process_manage(cqe);
+      break;
     }
   }
 
@@ -178,6 +224,8 @@ private:
       is_initialized_ = false;
     }
   }
+
+  void process_manage(io_uring_cqe *cqe);
 
   void process_accept(io_uring_cqe *cqe) {
     auto *sqe = get_sqe();
@@ -220,12 +268,12 @@ private:
 
           if constexpr (std::is_same_v<T, TestClientSession>) {
             if (conn.egress_queue) {
-              conn.egress_queue->clear(ring_chunks_pool,
-                                       [this](const BufferHandle16 &h) {
-                                         if (h.get_pool_id() == 0) {
-                                           buffer_pool.deallocate(h);
-                                         }
-                                       });
+              conn.egress_queue->clear(
+                  ring_chunks_pool, [this](const BufferHandle16 &h) {
+                    if (h.get_pool_id() == PoolType::DefaultPool16KB) {
+                      default_pool_16kb.deallocate(h);
+                    }
+                  });
               egress_pool.deallocate(conn.egress_queue);
               conn.egress_queue = nullptr;
             }
@@ -234,6 +282,22 @@ private:
         conn);
 
     connections_.release(handle);
+  }
+
+  void process_recv_test_client_session(io_uring_cqe *cqe,
+                                        TestClientSession &conn,
+                                        SessionHandle session_handle);
+
+  void process_send_test_client_session(io_uring_cqe *cqe,
+                                        TestClientSession &conn,
+                                        SessionHandle session_handle);
+
+  void close_conn(SessionHandle session_handle, int fd) {
+    io_uring_sqe *sqe = get_sqe();
+    io_uring_prep_close(sqe, fd);
+    sqe->user_data = UserData{.generation = session_handle.generation,
+                              .index = session_handle.index,
+                              .op = OpCode::Close};
   }
 
   void process_recv(io_uring_cqe *cqe) {
@@ -262,54 +326,7 @@ private:
           using T = std::decay_t<decltype(conn)>;
 
           if constexpr (std::is_same_v<T, TestClientSession>) {
-            if (cqe->res <= 0) {
-              if (cqe->res == -ECANCELED) {
-                return;
-              }
-              io_uring_sqe *sqe = get_sqe();
-              io_uring_prep_close(sqe, conn.fd);
-              sqe->user_data = UserData{.generation = handle.generation,
-                                        .index = handle.index,
-                                        .op = OpCode::Close};
-              return;
-            }
-
-            const bool has_buffer = (cqe->flags & IORING_CQE_F_BUFFER) != 0;
-
-            if (has_buffer) {
-              const auto bid =
-                  static_cast<uint16_t>(cqe->flags >> IORING_CQE_BUFFER_SHIFT);
-
-              BufferHandle16 handle_buf =
-                  this->provided_ring_pool_.get_by_bid(bid);
-              this->provided_ring_pool_.recycle_buffer(handle_buf, bid);
-
-              std::span<std::byte> sp(
-                  reinterpret_cast<std::byte *>(
-                      const_cast<char *>(test_http200.data())),
-                  test_http200.size());
-              handle_buf = BufferHandle16(sp, 123);
-
-              // this->provided_ring_pool_.recycle_buffer(
-              //     this->buffer_pool.allocate(), bid);
-
-              // handle_buf.set_size(cqe->res);
-              PendingChunk testChunk;
-              testChunk.add_handle(handle_buf);
-              if (conn.egress_queue == nullptr) {
-                conn.egress_queue = egress_pool.allocate(conn.fd);
-              }
-              conn.recv_paused = conn.egress_queue->push(std::move(testChunk),
-                                                         ring_chunks_pool);
-              if (!conn.recv_paused) {
-                io_uring_sqe *sqe = get_sqe();
-                conn.egress_queue->prepare_send_sqe(sqe);
-                sqe->user_data = UserData{.generation = handle.generation,
-                                          .index = handle.index,
-                                          .op = OpCode::Send};
-              }
-              return;
-            }
+            process_recv_test_client_session(cqe, conn, handle);
           }
         },
         conn);
@@ -340,46 +357,7 @@ private:
           using T = std::decay_t<decltype(conn)>;
 
           if constexpr (std::is_same_v<T, TestClientSession>) {
-            if (cqe->res <= 0) {
-              io_uring_sqe *sqe = get_sqe();
-              io_uring_prep_close(sqe, conn.fd);
-              sqe->user_data = UserData{.generation = handle.generation,
-                                        .index = handle.index,
-                                        .op = OpCode::Close};
-              return;
-            }
-
-            if (bool low_watermark = conn.egress_queue->on_send_complete(
-                    cqe->res, ring_chunks_pool,
-                    [this](const BufferHandle16 &h) {
-                      if (h.get_pool_id() == 0) {
-                        buffer_pool.deallocate(h);
-                      }
-                    });
-                conn.recv_paused && low_watermark) {
-              conn.recv_paused = false;
-            }
-            if (conn.egress_queue->empty()) {
-              egress_pool.deallocate(conn.egress_queue);
-              conn.egress_queue = nullptr;
-            } else {
-              io_uring_sqe *sqe = get_sqe();
-              conn.egress_queue->prepare_send_sqe(sqe);
-              sqe->user_data = UserData{.generation = handle.generation,
-                                        .index = handle.index,
-                                        .op = OpCode::Send};
-            }
-            if (!conn.recv_paused) {
-              auto *sqe = get_sqe();
-              io_uring_prep_recv(sqe, conn.fd, nullptr, 0, 0);
-              sqe->flags |= IOSQE_BUFFER_SELECT;
-              sqe->buf_group = provided_ring_pool_.get_bgid();
-              UserData ud{.generation = handle.generation,
-                          .index = handle.index,
-                          .op = OpCode::Recv};
-              io_uring_sqe_set_data64(sqe, ud);
-            }
-            return;
+            process_send_test_client_session(cqe, conn, handle);
           }
         },
         conn);
@@ -396,9 +374,10 @@ private:
                                               .op = OpCode::Send}));
   } // test
 
-  std::expected<void, std::string> add_listener_tcp(int port) {
-    auto mb_listener = Listener::create(port, Listener::Protocol::Tcp,
-                                        Listener::IpVersion::All);
+  std::expected<void, std::string>
+  add_listener(int port, Listener::Protocol protocol = Listener::Protocol::Tcp,
+               Listener::IpVersion ipVersion = Listener::IpVersion::Ipv4) {
+    auto mb_listener = Listener::create(port, protocol, ipVersion);
     if (!mb_listener) {
       return std::unexpected(
           std::format("Error create listener on port {}", port));

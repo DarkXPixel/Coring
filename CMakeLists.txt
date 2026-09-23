@@ -26,7 +26,9 @@ add_executable(exe src/main.cpp
     src/coring/Connection.cpp
     src/coring2/TcpConnection.cpp
     src/coring2/http1/http1_handler.cpp
-    src/coring3/ThreadWorker.cpp)
+    src/coring3/ThreadWorker.cpp
+    src/Coring4/EngineTestClientSession.cpp
+    src/Coring4/Engine.cpp)
 
 
 # target_include_directories(exe PRIVATE ${LIBURING_INCLUDE_DIRS})
