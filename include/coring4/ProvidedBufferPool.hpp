@@ -24,6 +24,12 @@ private:
 
 public:
   ProvidedBufferPool() noexcept = default;
+  ~ProvidedBufferPool() {
+    if (buf_ring_ != nullptr) {
+      std::free(buf_ring_);
+      buf_ring_ = nullptr;
+    }
+  }
 
   bool init(struct io_uring *ring, uint16_t bgid, uint32_t num_bufs) {
     ring_size_bytes_ = sizeof(struct io_uring_buf) * num_bufs;

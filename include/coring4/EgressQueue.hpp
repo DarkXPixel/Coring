@@ -47,15 +47,24 @@ public:
   bool push(PendingChunk &&chunk,
             ThreadLocalSlabPool<StackRingBuffer<PendingChunk, 32>, 16> &slab) {
     buffered_bytes_ += chunk.remaining_bytes();
-    if (inline_count_ < 2) {
-      inline_chunks_[inline_count_++] = chunk;
+
+    const bool use_overflow =
+        overflow_ring_ != nullptr || inline_count_ >= inline_chunks_.size();
+
+    if (!use_overflow) {
+      inline_chunks_[inline_count_++] = std::move(chunk);
     } else {
       if (overflow_ring_ == nullptr) {
         overflow_ring_ = slab.allocate();
+        if (overflow_ring_ == nullptr) {
+          return false;
+        }
       }
-      assert(overflow_ring_->push(std::move(chunk)));
-    }
 
+      if (!overflow_ring_->push(std::move(chunk))) {
+        return false;
+      }
+    }
     return buffered_bytes_ >= HIGH_WATERMARK;
   }
 
@@ -91,6 +100,7 @@ public:
       if (!collect_iov(inline_chunks_[i])) {
         break;
       }
+      offset = 0;
     }
 
     if (iov_count_ < 16 && (overflow_ring_ != nullptr)) {
@@ -114,14 +124,13 @@ public:
         io_uring_prep_send(sqe, fd_, buf_addr, buf_len, 0);
       }
     } else {
-      struct msghdr msg_;
-      msg_ = {};
-      msg_.msg_iov = iov_batch_.data();
-      msg_.msg_iovlen = iov_count_;
+      send_msg_ = {};
+      send_msg_.msg_iov = iov_batch_.data();
+      send_msg_.msg_iovlen = iov_count_;
       if (use_zc) {
-        io_uring_prep_sendmsg_zc(sqe, fd_, &msg_, 0);
+        io_uring_prep_sendmsg_zc(sqe, fd_, &send_msg_, 0);
       } else {
-        io_uring_prep_sendmsg(sqe, fd_, &msg_, 0);
+        io_uring_prep_sendmsg(sqe, fd_, &send_msg_, 0);
       }
     }
 
@@ -166,7 +175,10 @@ public:
     }
   }
 
-  bool empty() const noexcept { return inline_head_ == inline_count_; }
+  bool empty() const noexcept {
+    return inline_head_ == inline_count_ &&
+           (overflow_ring_ == nullptr || overflow_ring_->empty());
+  }
 
 private:
   PendingChunk &get_front_chunk() noexcept {
@@ -204,5 +216,6 @@ private:
   StackRingBuffer<PendingChunk, 32> *overflow_ring_{nullptr};
   std::array<struct iovec, MAX_IOV_BATCH> iov_batch_;
   std::size_t iov_count_{0};
+  msghdr send_msg_;
 };
 } // namespace Coring4

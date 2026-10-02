@@ -13,15 +13,16 @@ class BufferHandle16 {
     std::byte *ptr_{nullptr};
     const char *t;
   };
-  uint32_t size_{0};
+  uint64_t size_ : 56 {0};
   PoolType pool_id_{-1};
 
   // uint32_t flags_ : 8;
 
 public:
   BufferHandle16() = default;
-  BufferHandle16(std::span<std::byte> buf, PoolType pool_id)
-      : pool_id_(pool_id), ptr_(buf.data()), size_(buf.size()) {}
+  BufferHandle16(std::span<const std::byte> buf, PoolType pool_id)
+      : pool_id_(pool_id), ptr_(const_cast<std::byte *>(buf.data())),
+        size_(buf.size()) {}
   BufferHandle16(const BufferHandle16 &) = default;
   BufferHandle16 &operator=(const BufferHandle16 &) = default;
 

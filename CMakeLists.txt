@@ -14,8 +14,16 @@ find_package(Boost REQUIRED)
 
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
 
-add_compile_options(-g)
-add_compile_options(-fno-omit-frame-pointer)
+
+option(ENABLE_ASAN "Enable AddressSanitizer (Memory Leaks & Out of Bounds)" OFF)
+option(ENABLE_TSAN "Enable ThreadSanitizer (Data Races)" OFF)
+
+
+if(ENABLE_ASAN AND ENABLE_TSAN)
+    message(FATAL_ERROR "AddressSanitizer and ThreadSanitizer cannot be used together.")
+endif()
+
+
 
 add_executable(exe src/main.cpp
     src/coring_uring/UringEngine.cpp
@@ -31,10 +39,18 @@ add_executable(exe src/main.cpp
     src/Coring4/Engine.cpp)
 
 
-# target_include_directories(exe PRIVATE ${LIBURING_INCLUDE_DIRS})
-# target_link_directories(exe PRIVATE ${LIBURING_LIBRARY_DIRS})
-# target_link_libraries(exe PUBLIC picohttpparser)
-# target_link_libraries(exe PRIVATE ${LIBURING_LIBRARIES})
+if(ENABLE_ASAN)
+    message(STATUS "Building with AddressSanitizer (ASan)")
+    target_compile_options(exe PRIVATE -fsanitize=address -g -O1 -fno-omit-frame-pointer)
+    target_link_options(exe PRIVATE -fsanitize=address)
+endif()
+
+if(ENABLE_TSAN)
+    message(STATUS "Building with ThreadSanitizer (TSan)")
+    target_compile_options(exe PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(exe PRIVATE -fsanitize=thread)
+endif()
+
 
 target_link_libraries(exe PRIVATE 
     PkgConfig::LIBURING Boost::boost

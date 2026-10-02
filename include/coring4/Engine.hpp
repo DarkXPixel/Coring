@@ -3,13 +3,17 @@
 #include "coring4/BufferHandle.hpp"
 #include "coring4/BufferPool.hpp"
 #include "coring4/EgressQueue.hpp"
+#include "coring4/Http1Stage.hpp"
 #include "coring4/Listener.hpp"
 #include "coring4/ManageService.hpp"
 #include "coring4/PoolType.hpp"
 #include "coring4/ProvidedBufferPool.hpp"
+#include "coring4/Router.hpp"
 #include "coring4/SessionStorage.hpp"
 #include "coring4/Sessions.hpp"
 #include "coring4/ThreadLocalSlabPool.hpp"
+#include "coring4/UpstreamConnection.hpp"
+#include "coring4/UpstreamPool.hpp"
 #include <algorithm>
 #include <array>
 #include <asm-generic/socket.h>
@@ -29,11 +33,13 @@
 #include <netinet/tcp.h>
 #include <print>
 #include <stop_token>
+#include <string>
 #include <string_view>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <thread>
 
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -43,11 +49,11 @@ private:
   static constexpr auto RING_ENTRIES_COUNT = 4096;
 
   io_uring ring_;
-  bool is_initialized_{false};
 
-  std::vector<Listener> listeners_;
+  SessionStorage<ClientConnectionVariant> connections_{10000};
+  SessionStorage<UpstreamConnectionVariant> upstream_connections_{5000};
 
-  SessionStorage<ClientConnectionVariant> connections_;
+  // UpstreamMap upstreams_{upstream_connections_};
 
   LocalBufferPool<> default_pool_16kb{PoolType::DefaultPool16KB, 8192};
 
@@ -55,14 +61,15 @@ private:
   ThreadLocalSlabPool<EgressQueue, 8192> egress_pool;
   ThreadLocalSlabPool<StackRingBuffer<PendingChunk, 32>, 16> ring_chunks_pool;
 
-  uint16_t need_to_push_ring_pool{0};
+  Router router_;
 
   bool is_running_{true};
+  bool is_initialized_{false};
 
   uint64_t buf_for_singnal;
   std::shared_ptr<Manage::WorkerChannel> channel_;
 
-  // boost::container::small_vector<class T, std::size_t N>//TEMP
+  std::vector<Listener> listeners_;
 
   enum class OpCode : uint8_t {
     Accept = 0,
@@ -132,6 +139,17 @@ public:
     }
     engine->provided_ring_pool_.advanace();
     engine->create_or_get_worker_channel();
+
+    RouteListener listener;
+    listener.port = 8088;
+    listener.tls_on = false;
+    listener.routes_in["localhost:8088"] =
+        Route{.server_name = "localhost:8088", .port = 8088};
+    listener.routes_in["localhost:8088"].out_routes["/"].root =
+        "/home/darkxpixel/code/Coring/http_test/";
+    listener.routes_in["localhost:8088"].out_routes["/"].index = "index.html";
+
+    engine->router_.add_route(8088, listener);
     engine->is_initialized_ = true;
     return engine;
   }
@@ -160,7 +178,6 @@ public:
       write(stop_fd, &val, sizeof(val));
     });
 
-    // auto _ = add_listener(8080);
     is_running_ = true;
     while (is_running_) {
       io_uring_cqe *cqe{nullptr};
@@ -204,6 +221,9 @@ public:
     case OpCode::Recv:
       process_recv(cqe);
       break;
+    case OpCode::Read:
+      process_read(cqe);
+      break;
     case OpCode::StopSignal:
       is_running_ = false;
       std::println("Stop signal");
@@ -225,72 +245,31 @@ private:
     }
   }
 
-  void process_manage(io_uring_cqe *cqe);
-
-  void process_accept(io_uring_cqe *cqe) {
-    auto *sqe = get_sqe();
-    io_uring_prep_recv(sqe, cqe->res, nullptr, 0, 0);
-    sqe->flags |= IOSQE_BUFFER_SELECT | IOSQE_IO_LINK;
-    sqe->buf_group = provided_ring_pool_.get_bgid();
-
-    auto [handle, slot] = connections_.emplace<std::monostate>();
-
-    if (!handle.is_valid()) {
-      ::close(cqe->res);
-      return;
-    }
-    auto &detection = slot->emplace<TestClientSession>();
-    detection.fd = cqe->res;
-
-    UserData ud{.generation = handle.generation,
-                .index = handle.index,
-                .op = OpCode::Recv};
-    io_uring_sqe_set_data64(sqe, std::bit_cast<uint64_t>(ud));
-  }
-
-  void process_close(io_uring_cqe *cqe) {
-    if (cqe->user_data == 0) {
-      return;
-    }
-
-    auto ud = std::bit_cast<UserData>(cqe->user_data);
-    auto handle = SessionHandle{.index = ud.index, .generation = ud.generation};
-    auto *mb_conn =
-        connections_.get({.index = ud.index, .generation = ud.generation});
-    if (mb_conn == nullptr) {
-      return;
-    }
-
-    ClientConnectionVariant &conn = *mb_conn;
-    std::visit(
-        [cqe, this, handle](auto &conn) {
-          using T = std::decay_t<decltype(conn)>;
-
-          if constexpr (std::is_same_v<T, TestClientSession>) {
-            if (conn.egress_queue) {
-              conn.egress_queue->clear(
-                  ring_chunks_pool, [this](const BufferHandle16 &h) {
-                    if (h.get_pool_id() == PoolType::DefaultPool16KB) {
-                      default_pool_16kb.deallocate(h);
-                    }
-                  });
-              egress_pool.deallocate(conn.egress_queue);
-              conn.egress_queue = nullptr;
-            }
-          }
-        },
-        conn);
-
-    connections_.release(handle);
-  }
-
   void process_recv_test_client_session(io_uring_cqe *cqe,
                                         TestClientSession &conn,
                                         SessionHandle session_handle);
 
+  void process_recv_http1_client_session(io_uring_cqe *cqe,
+                                         Http1ClientSession &conn,
+                                         SessionHandle session_handle);
+
+  void process_send_http1_client_session(io_uring_cqe *cqe,
+                                         Http1ClientSession &conn,
+                                         SessionHandle session_handle);
+  void process_read_static_upstream_session(io_uring_cqe *cqe,
+                                            StaticUpstreamSession &conn,
+                                            SessionHandle session_handle);
+
+  void add_data_to_send(SendRecvSession &conn, PendingChunk &&chunk);
+  void send_data(SendRecvSession &conn);
+
   void process_send_test_client_session(io_uring_cqe *cqe,
                                         TestClientSession &conn,
                                         SessionHandle session_handle);
+
+  void process_close_test_client_session(io_uring_cqe *cqe,
+                                         TestClientSession &conn,
+                                         SessionHandle session_handle);
 
   void close_conn(SessionHandle session_handle, int fd) {
     io_uring_sqe *sqe = get_sqe();
@@ -300,14 +279,31 @@ private:
                               .op = OpCode::Close};
   }
 
-  void process_recv(io_uring_cqe *cqe) {
-    static std::string test_http200 = "HTTP/1.1 200 OK\r\n"
-                                      "Content-Type: text/plain\r\n"
-                                      "Content-Length: 13\r\n"
-                                      "Connection: keep-alive\r\n"
-                                      "\r\n"
-                                      "Hello, World!";
+  void process_read(io_uring_cqe *cqe) {
+    if (cqe->user_data == 0) {
+      return;
+    }
+    auto ud = std::bit_cast<UserData>(cqe->user_data);
 
+    auto handle = SessionHandle{.index = ud.index, .generation = ud.generation};
+    auto *mb_conn = upstream_connections_.get(
+        {.index = ud.index, .generation = ud.generation});
+    if (mb_conn == nullptr) {
+      return;
+    }
+
+    UpstreamConnectionVariant &conn = *mb_conn;
+    std::visit(
+        [cqe, this, handle](auto &conn) {
+          using T = std::decay_t<decltype(conn)>;
+
+          if constexpr (std::is_same_v<T, StaticUpstreamSession>) {
+            process_read_static_upstream_session(cqe, conn, handle);
+          }
+        },
+        conn);
+  }
+  void process_recv(io_uring_cqe *cqe) {
     if (cqe->user_data == 0) {
       return;
     }
@@ -328,16 +324,67 @@ private:
           if constexpr (std::is_same_v<T, TestClientSession>) {
             process_recv_test_client_session(cqe, conn, handle);
           }
+          if constexpr (std::is_same_v<T, Http1ClientSession>) {
+            process_recv_http1_client_session(cqe, conn, handle);
+          }
         },
         conn);
   }
 
-  // void flush_tx_queue(TestClientSession &session) {
-  //   while (auto buf_opt = session.tx_queue.peek()) {
-  //     auto &buf = *buf_opt;
-  //   }
-  // }
+  void process_manage(io_uring_cqe *cqe);
 
+  void prep_client_recv_provided_buf(int fd, SessionHandle handle) {
+    auto *sqe = get_sqe();
+    io_uring_prep_recv(sqe, fd, nullptr, 0, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = provided_ring_pool_.get_bgid();
+    sqe->user_data = UserData::create(handle, OpCode::Recv);
+  }
+
+  void process_accept(io_uring_cqe *cqe) {
+    const auto ud = std::bit_cast<UserData>(cqe->user_data);
+    uint16_t port = ud.index;
+    bool has_tls{false};
+    if (auto mb_tls = router_.tls_on(port); mb_tls) {
+      has_tls = mb_tls.value();
+    } else {
+      ::close(cqe->res);
+      return;
+    }
+
+    if (!has_tls) { // only http1
+      auto [handle, slot] = connections_.emplace<std::monostate>();
+      if (!handle.is_valid()) {
+        ::close(cqe->res);
+        return;
+      }
+
+      auto &http1 = slot->emplace<Http1ClientSession>();
+      http1.fd = cqe->res;
+      http1.tls_on = has_tls;
+      http1.stage = Http1Stage::ReadingHeaders;
+      http1.port = port;
+      prep_client_recv_provided_buf(cqe->res, handle);
+      return;
+    }
+
+    return;
+    auto *sqe = get_sqe();
+    io_uring_prep_recv(sqe, cqe->res, nullptr, 0, 0);
+    sqe->flags |= IOSQE_BUFFER_SELECT;
+    sqe->buf_group = provided_ring_pool_.get_bgid();
+
+    auto [handle, slot] = connections_.emplace<std::monostate>();
+
+    if (!handle.is_valid()) {
+      ::close(cqe->res);
+      return;
+    }
+    auto &detection = slot->emplace<TestClientSession>();
+    detection.fd = cqe->res;
+
+    sqe->user_data = UserData::create(handle, OpCode::Recv);
+  }
   void process_send(io_uring_cqe *cqe) {
     if (cqe->user_data == 0) {
       return;
@@ -359,20 +406,39 @@ private:
           if constexpr (std::is_same_v<T, TestClientSession>) {
             process_send_test_client_session(cqe, conn, handle);
           }
+          if constexpr (std::is_same_v<T, Http1ClientSession>) {
+            process_send_http1_client_session(cqe, conn, handle);
+          }
         },
         conn);
   }
 
-  void send_data(int fd, BufferHandle16 handle_data,
-                 SessionHandle handle) noexcept {
-    auto *sqe = get_sqe();
-    io_uring_prep_send(sqe, fd, handle_data.data(), handle_data.size(), 0);
+  void process_close(io_uring_cqe *cqe) {
+    if (cqe->user_data == 0) {
+      return;
+    }
 
-    io_uring_sqe_set_data64(
-        sqe, std::bit_cast<uint64_t>(UserData{.generation = handle.generation,
-                                              .index = handle.index,
-                                              .op = OpCode::Send}));
-  } // test
+    auto ud = std::bit_cast<UserData>(cqe->user_data);
+    auto handle = SessionHandle{.index = ud.index, .generation = ud.generation};
+    auto *mb_conn =
+        connections_.get({.index = ud.index, .generation = ud.generation});
+    if (mb_conn == nullptr) {
+      return;
+    }
+
+    ClientConnectionVariant &conn = *mb_conn;
+    std::visit(
+        [cqe, this, handle](auto &conn) {
+          using T = std::decay_t<decltype(conn)>;
+
+          if constexpr (std::is_same_v<T, TestClientSession>) {
+            process_close_test_client_session(cqe, conn, handle);
+          }
+        },
+        conn);
+
+    connections_.release(handle);
+  }
 
   std::expected<void, std::string>
   add_listener(int port, Listener::Protocol protocol = Listener::Protocol::Tcp,
@@ -383,17 +449,18 @@ private:
           std::format("Error create listener on port {}", port));
     }
     std::println("Add listener{}", mb_listener->listen_address());
-    submit_accept(mb_listener->fd());
+    submit_accept(mb_listener->fd(), port);
     listeners_.push_back(std::move(*mb_listener));
     return {};
   }
 
-  void submit_accept(int listen_fd) {
+  void submit_accept(int listen_fd, uint16_t port) {
     auto *sqe = get_sqe();
     io_uring_prep_multishot_accept(sqe, listen_fd, nullptr, nullptr,
                                    SOCK_CLOEXEC | SOCK_NONBLOCK);
 
     UserData ud = {.generation = static_cast<uint32_t>(listen_fd),
+                   .index = static_cast<uint32_t>(port),
                    .op = OpCode::Accept};
     sqe->user_data = std::bit_cast<uint64_t>(ud);
   }

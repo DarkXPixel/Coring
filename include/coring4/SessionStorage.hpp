@@ -14,8 +14,7 @@ struct SessionHandle {
   bool operator==(const SessionHandle &) const = default;
 };
 
-template <typename VariantType, std::size_t MaxCapacity = 10000>
-class SessionStorage {
+template <typename VariantType> class SessionStorage {
   struct Slot {
     VariantType data;
     uint32_t generation{1};
@@ -25,8 +24,10 @@ class SessionStorage {
   std::vector<Slot> slots_;
   std::vector<uint32_t> free_list_;
 
+  const std::size_t MaxCapacity = 10000;
+
 public:
-  SessionStorage() {
+  SessionStorage(std::size_t capacity) : MaxCapacity(capacity) {
     slots_.resize(MaxCapacity);
     free_list_.resize(MaxCapacity);
     for (uint32_t i = MaxCapacity; i > 0; --i) {
