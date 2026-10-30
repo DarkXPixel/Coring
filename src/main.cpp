@@ -1,55 +1,38 @@
-#include "coring4/Listener.hpp"
 #include "coring4/ManageService.hpp"
-#include "coring4/ThreadWorker.hpp"
+#include "coring4/Worker/Worker.hpp"
+#include "coring4/io/IoOp.hpp"
+#include "coring4/listeners/Listener.hpp"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <csignal>
 #include <memory>
 #include <print>
+#include <thread>
 
 std::atomic_bool shutdown_requested{false};
 
-void signal_handler(int signal) {
-  shutdown_requested.store(true, std::memory_order_relaxed);
-  shutdown_requested.notify_one();
-}
+void signal_handler(int signal) {}
 
 int main(int argc, char *argv[]) {
   std::signal(SIGINT, signal_handler);
   std::signal(SIGTERM, signal_handler);
 
-  Coring4::Manage::ManageService manage;
-
-  std::array<std::unique_ptr<Coring4::ThreadWorker>, 3> threads;
-  uint32_t th_c = 0;
-  for (auto &i : threads) {
-    auto th = Coring4::ThreadWorker::createAndStart(th_c);
-    th_c += 2;
-    if (!th.has_value()) {
-      return -1;
-    }
-    manage.add_channel((*th)->get_channel());
-    i = std::move(*th);
+  auto worker = Coring4::Worker::create(Coring4::WorkerId(0));
+  if (!worker) {
+    std::println("{}", worker.error());
   }
-  // auto th1 = Coring4::ThreadWorker::createAndStart();
-  // if (!th1.has_value()) {
-  //   std::println("{}", th.error());
-  //   return -1;
-  // }
 
-  manage.send_request(Coring4::Manage::AddListenerRequest{
-      .port = 8080,
-      .protocol = Coring4::Listener::Protocol::Tcp,
-      .version = Coring4::Listener::IpVersion::All});
+  std::shared_ptr<Coring4::Manage::WorkerChannel> channel =
+      worker.value().create_or_get_worker_channel();
 
-  manage.send_request(Coring4::Manage::AddListenerRequest{
-      .port = 8088,
-      .protocol = Coring4::Listener::Protocol::Tcp,
-      .version = Coring4::Listener::IpVersion::All});
+  std::jthread th([&channel]() {
+    std::this_thread::sleep_for(std::chrono::seconds(10));
+    channel->push(Coring4::Manage::ManageRequest{
+        .request = Coring4::Manage::AddListenerRequest{}});
+  });
 
-  shutdown_requested.wait(false);
-
-  // th->get()->stop();
+  worker.value().run();
 
   return 0;
 }

@@ -3,6 +3,19 @@
 #include <cstddef>
 #include <cstdint>
 namespace Coring4 {
+
+enum class TransportProtocol {
+  Tcp,
+  Udp,
+};
+
+enum class ApplicationProtocol {
+  L4,
+  HTTP1,
+  HTTP2,
+  QUIC,
+};
+
 enum class OpCode : uint8_t {
   Accept,
   Send,

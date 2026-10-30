@@ -1,23 +1,27 @@
 #pragma once
 
 #include "coring4/IoUring/IoUringBackend.hpp"
+#include "coring4/IoUring/IoUringBackendConfig.hpp"
 #include "coring4/ManageService.hpp"
 #include "coring4/core/Types.hpp"
 #include "coring4/io/IoOp.hpp"
 #include "coring4/io/IoOpCompletion.hpp"
+#include "coring4/listeners/Listener.hpp"
 #include <expected>
 #include <liburing.h>
 #include <liburing/io_uring.h>
 #include <string>
 #include <sys/eventfd.h>
 #include <variant>
+#include <vector>
 namespace Coring4 {
 class Worker {
 public:
   static std::expected<Worker, std::string> create(WorkerId id) {
     Worker result;
     result.worker_id_ = id;
-    if (auto backend = IOUringBackend::create(); backend) {
+    IoUringBackendConfig iouring_config{};
+    if (auto backend = IOUringBackend::create(iouring_config); backend) {
       result.backend_ = std::move(backend.value());
     } else {
       return std::unexpected(backend.error());
@@ -46,6 +50,15 @@ public:
     }));
   }
 
+  void add_listener(Listener2 listener) {
+    if (listener.get_transport() == TransportProtocol::Tcp) {
+      backend_.prep_multishot_accept(io_ops_.allocate_and_construct(
+          IoOp{.fd = listener.get_fd(), .op_code = OpCode::Accept}));
+    } else if(listener.get_transport() == TransportProtocol::Udp) {
+      
+    }
+  }
+
   void on_manage(IoCompletion completion) noexcept {
     uint64_t val;
     ::read(completion.op->fd, &val, sizeof(val));
@@ -54,6 +67,8 @@ public:
     for (auto &req : requests) {
       std::visit([this](auto &&arg) {}, req.request);
     }
+
+    val = 0;
   }
 
   void on_io(IoCompletion completion) {
@@ -68,16 +83,18 @@ public:
     case OpCode::Read:
     case OpCode::Write:
     case OpCode::Manage:
+      on_manage(completion);
       break;
     case OpCode::Poll:
       break;
     }
+    if (!completion.more()) {
+      io_ops_.deallocate(completion.op);
+    }
   }
 
   void run() noexcept {
-    if (channel_ == nullptr) {
-      return;
-    }
+    init_on_thread();
 
     is_running_ = true;
 
@@ -98,5 +115,6 @@ private:
   IoOpPool io_ops_;
   uint64_t buf_for_signal{};
   bool is_running_{false};
+  std::vector<Listener2> listeners_;
 };
 } // namespace Coring4

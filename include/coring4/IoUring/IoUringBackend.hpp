@@ -1,8 +1,10 @@
 #pragma once
 
+#include "IoUringBackendConfig.hpp"
 #include "coring4/core/Types.hpp"
 #include "coring4/io/IoOp.hpp"
 #include "coring4/io/IoOpCompletion.hpp"
+#include <bit>
 #include <cerrno>
 #include <expected>
 #include <liburing.h>
@@ -23,19 +25,33 @@ public:
   IOUringBackend &operator=(IOUringBackend &&other) noexcept {
     is_initialized = std::exchange(other.is_initialized, false);
     uring_ = other.uring_;
+    return *this;
   }
 
-  static std::expected<IOUringBackend, std::string> create() {
+  static std::expected<IOUringBackend, std::string>
+  create(const IoUringBackendConfig &config) {
     IOUringBackend result;
     io_uring_params params{};
-    params.flags |= IORING_SETUP_SINGLE_ISSUER;
+    if (!std::has_single_bit(config.cq_entries) ||
+        !std::has_single_bit(config.sq_entries)) {
+      return std::unexpected(
+          "Invalid io_uring config. cq_entries and sq_entries must be pow2");
+    }
 
-    auto ret = io_uring_queue_init_params(4096, &result.uring_, &params);
+    if (config.single_issuer) {
+      params.flags |= IORING_SETUP_SINGLE_ISSUER;
+    }
+    params.flags |= IORING_SETUP_CQSIZE;
+    params.cq_entries = config.cq_entries;
+
+    auto ret =
+        io_uring_queue_init_params(config.sq_entries, &result.uring_, &params);
 
     if (ret < 0) {
       return std::unexpected("Failed to init io_uring");
     }
     result.is_initialized = true;
+    result.config = config;
     return result;
   }
 
@@ -43,6 +59,13 @@ public:
     io_uring_sqe *sqe = get_sqe();
     io_uring_prep_read(sqe, op->fd, op->buffer_handle.ptr, op->size,
                        op->offset);
+    io_uring_sqe_set_data(sqe, op);
+  }
+
+  void prep_multishot_accept(IoOp *op) noexcept {
+    io_uring_sqe *sqe = get_sqe();
+    io_uring_prep_multishot_accept(sqe, op->fd, nullptr, nullptr,
+                                   SOCK_CLOEXEC | SOCK_NONBLOCK);
     io_uring_sqe_set_data(sqe, op);
   }
 
@@ -76,11 +99,16 @@ public:
       };
       callback(completion);
     }
+
+    io_uring_cq_advance(&uring_, count);
+
+    return std::nullopt;
   }
 
 private:
   io_uring_sqe *get_sqe() noexcept { return io_uring_get_sqe(&uring_); }
   io_uring uring_;
   bool is_initialized{false};
+  IoUringBackendConfig config;
 };
 } // namespace Coring4
