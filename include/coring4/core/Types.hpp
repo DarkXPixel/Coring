@@ -43,6 +43,14 @@ struct PoolBufferHandle {
 
 enum class PoolId : uint8_t { Empty = 0 };
 
+struct RouteId {
+  uint32_t value;
+};
+
+struct UpstreamId {
+  uint32_t value;
+};
+
 // struct PoolId {
 //   uint8_t id{};
 // };

@@ -68,3 +68,6 @@ Testing/
 .cache/
 
 .vscode/
+.aider*
+.zed/
+.github/

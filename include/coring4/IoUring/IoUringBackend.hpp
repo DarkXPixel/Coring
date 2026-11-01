@@ -28,6 +28,8 @@ public:
     return *this;
   }
 
+  io_uring *get_uring() noexcept { return &uring_; }
+
   static std::expected<IOUringBackend, std::string>
   create(const IoUringBackendConfig &config) {
     IOUringBackend result;

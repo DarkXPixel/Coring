@@ -134,8 +134,8 @@ public:
       return std::unexpected("Failed to init provided ring pool");
     }
     for (int i = 0; i < ring_pool_size; ++i) {
-      engine->provided_ring_pool_.recycle_buffer(
-          engine->default_pool_16kb.allocate(), i);
+      // engine->provided_ring_pool_.recycle_buffer(
+      //     engine->default_pool_16kb.allocate(), i);
     }
     engine->provided_ring_pool_.advanace();
     engine->create_or_get_worker_channel();

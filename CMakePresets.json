@@ -1,42 +1,129 @@
 {
-    "version": 8,
-    "configurePresets": [
-        {
-            "name": "g16-debug",
-            "displayName": "GCC 16.0.1 x86_64-linux-gnu-debug",
-            "description": "Using compilers: C = /usr/bin/gcc-16, CXX = /usr/bin/g++-16",
-            "binaryDir": "${sourceDir}/out/build/${presetName}",
-            "generator": "Ninja",
-            "cacheVariables": {
-                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
-                "CMAKE_C_COMPILER": "/usr/bin/clang",
-                "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
-                "CMAKE_BUILD_TYPE": "Debug"
-            }
-        },
-        {
-            "name": "g16-release",
-            "displayName": "GCC 16.0.1 x86_64-linux-gnu-release",
-            "description": "Using compilers: C = /usr/bin/gcc-16, CXX = /usr/bin/g++-16",
-            "binaryDir": "${sourceDir}/out/build/${presetName}",
-            "cacheVariables": {
-                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
-                "CMAKE_C_COMPILER": "/usr/bin/gcc",
-                "CMAKE_CXX_COMPILER": "/usr/bin/g++",
-                "CMAKE_BUILD_TYPE": "Release"
-            }
-        },
-        {
-            "name": "g16-release-with-dbg",
-            "displayName": "GCC 16.0.1 x86_64-linux-gnu-rel-with-dbg",
-            "description": "Using compilers: C = /usr/bin/gcc-16, CXX = /usr/bin/g++-16",
-            "binaryDir": "${sourceDir}/out/build/${presetName}",
-            "cacheVariables": {
-                "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
-                "CMAKE_C_COMPILER": "/usr/bin/gcc",
-                "CMAKE_CXX_COMPILER": "/usr/bin/g++",
-                "CMAKE_BUILD_TYPE": "RelWithDebInfo"
-            }
-        }
-    ]
+  "version": 8,
+  "configurePresets": [
+    {
+      "name": "g16-debug",
+      "displayName": "GCC 16.0.1 x86_64-linux-gnu-debug",
+      "description": "Using compilers: C = /usr/bin/gcc-16, CXX = /usr/bin/g++-16",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+        "CMAKE_C_COMPILER": "/usr/bin/clang",
+        "CMAKE_CXX_COMPILER": "/usr/bin/clang++",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "g16-release",
+      "displayName": "GCC 16.0.1 x86_64-linux-gnu-release",
+      "description": "Using compilers: C = /usr/bin/gcc-16, CXX = /usr/bin/g++-16",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+        "CMAKE_C_COMPILER": "/usr/bin/gcc",
+        "CMAKE_CXX_COMPILER": "/usr/bin/g++",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "g16-release-with-dbg",
+      "displayName": "GCC 16.0.1 x86_64-linux-gnu-rel-with-dbg",
+      "description": "Using compilers: C = /usr/bin/gcc-16, CXX = /usr/bin/g++-16",
+      "binaryDir": "${sourceDir}/out/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/install/${presetName}",
+        "CMAKE_C_COMPILER": "/usr/bin/gcc",
+        "CMAKE_CXX_COMPILER": "/usr/bin/g++",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+    {
+      "name": "coring5-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "cacheVariables": {
+        "CORING_BUILD_LEGACY": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "coring5-debug",
+      "displayName": "Coring5 debug (gcc)",
+      "inherits": "coring5-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "coring5-release",
+      "displayName": "Coring5 release (gcc, LTO)",
+      "inherits": "coring5-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+    {
+      "name": "coring5-asan",
+      "displayName": "Coring5 ASan+UBSan",
+      "inherits": "coring5-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "OFF",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address,undefined"
+      }
+    },
+    {
+      "name": "coring5-tsan",
+      "displayName": "Coring5 TSan",
+      "inherits": "coring5-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "OFF",
+        "CMAKE_CXX_FLAGS": "-fsanitize=thread -O1 -g",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=thread"
+      }
+    },
+    {
+      "name": "coring5-fuzz",
+      "displayName": "Coring5 libFuzzer (clang)",
+      "inherits": "coring5-base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "OFF",
+        "CORING5_FUZZ": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "coring5-debug", "configurePreset": "coring5-debug" },
+    { "name": "coring5-release", "configurePreset": "coring5-release" },
+    { "name": "coring5-asan", "configurePreset": "coring5-asan" },
+    { "name": "coring5-tsan", "configurePreset": "coring5-tsan" },
+    { "name": "coring5-fuzz", "configurePreset": "coring5-fuzz" }
+  ],
+  "testPresets": [
+    {
+      "name": "coring5-debug",
+      "configurePreset": "coring5-debug",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "coring5-asan",
+      "configurePreset": "coring5-asan",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "coring5-tsan",
+      "configurePreset": "coring5-tsan",
+      "output": { "outputOnFailure": true }
+    }
+  ]
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "coring4/Listener.hpp"
+#include "coring4/routing/RouteUpdate.hpp"
 #include <algorithm>
 #include <functional>
 #include <memory>
@@ -8,6 +9,8 @@
 #include <queue>
 #include <string>
 #include <sys/types.h>
+#include <unistd.h>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -18,7 +21,15 @@ struct AddListenerRequest {
   Listener::IpVersion version{Listener::IpVersion::Ipv4};
 };
 
-using ManageRequestVariant = std::variant<AddListenerRequest>;
+// Install a new routing table on a worker. The table is compiled once by the
+// control plane (see RoutingControl) and shared read-only by all workers.
+struct UpdateRoutesRequest {
+  std::shared_ptr<const RouteTable> table;
+  std::shared_ptr<RouteUpdateAck> ack; // may be null
+};
+
+using ManageRequestVariant =
+    std::variant<AddListenerRequest, UpdateRoutesRequest>;
 
 struct ManageRequest {
   ManageRequestVariant request;
@@ -58,7 +69,7 @@ public:
 
   void send_request(ManageRequestVariant &&request) {
     ManageRequest req;
-    req.request = request;
+    req.request = std::move(request);
     for (auto &worker : worker_channels) {
       worker->push(req);
     }

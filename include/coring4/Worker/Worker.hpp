@@ -1,15 +1,24 @@
 #pragma once
 
+#include "coring4/BufferHandle.hpp"
+#include "coring4/BufferPool.hpp"
 #include "coring4/IoUring/IoUringBackend.hpp"
 #include "coring4/IoUring/IoUringBackendConfig.hpp"
 #include "coring4/ManageService.hpp"
+#include "coring4/PoolType.hpp"
+#include "coring4/ProvidedBufferPool.hpp"
 #include "coring4/core/Types.hpp"
 #include "coring4/io/IoOp.hpp"
 #include "coring4/io/IoOpCompletion.hpp"
 #include "coring4/listeners/Listener.hpp"
+#include "coring4/routing/WorkerRouting.hpp"
+#include "coring4/storage/ObjectPool.hpp"
+#include <algorithm>
 #include <expected>
 #include <liburing.h>
 #include <liburing/io_uring.h>
+#include <memory>
+#include <print>
 #include <string>
 #include <sys/eventfd.h>
 #include <variant>
@@ -40,6 +49,14 @@ public:
   }
 
   void init_on_thread() noexcept {
+    tcp_provided_buffer_pool.init(backend_.get_uring(), 0, 1024);
+    for (int i = 0; i < 1024; ++i) {
+      BufferHandle16 handle;
+      tcp_provided_buffer_pool.recycle_buffer(
+          tcp_buffer_pool.allocate()->data(), i);
+    }
+
+    tcp_provided_buffer_pool.advanace();
     if (channel_ == nullptr) {
       return;
     }
@@ -54,8 +71,7 @@ public:
     if (listener.get_transport() == TransportProtocol::Tcp) {
       backend_.prep_multishot_accept(io_ops_.allocate_and_construct(
           IoOp{.fd = listener.get_fd(), .op_code = OpCode::Accept}));
-    } else if(listener.get_transport() == TransportProtocol::Udp) {
-      
+    } else if (listener.get_transport() == TransportProtocol::Udp) {
     }
   }
 
@@ -65,15 +81,40 @@ public:
 
     auto requests = channel_->pop_all();
     for (auto &req : requests) {
-      std::visit([this](auto &&arg) {}, req.request);
+      std::visit(
+          [this](auto &&arg) {
+            using T = std::decay_t<decltype(arg)>;
+            if constexpr (std::is_same_v<T, Manage::UpdateRoutesRequest>) {
+              // Same thread as every route lookup: a plain swap, no locking.
+              auto res = routing_.install(std::move(arg.table));
+              if (!res) {
+                std::println("worker {}: route update rejected: {}",
+                             worker_id_.id, res.error());
+              }
+              if (arg.ack) {
+                arg.ack->complete(res);
+              }
+            }
+          },
+          req.request);
     }
 
     val = 0;
   }
 
+  void on_accept(IoCompletion completion) noexcept {
+    auto it =
+        std::ranges::find(listeners_, completion.op->fd, &Listener2::get_fd);
+    if (it == listeners_.end()) {
+      return;
+    }
+  }
+
   void on_io(IoCompletion completion) {
     switch (completion.op->op_code) {
     case OpCode::Accept:
+      on_accept(completion);
+      break;
     case OpCode::Send:
     case OpCode::Recv:
     case OpCode::StopSignal:
@@ -111,8 +152,13 @@ private:
   WorkerId worker_id_;
   IOUringBackend backend_;
 
+  WorkerRouting routing_;
+  std::shared_ptr<const class UpstreamRules> upstream_rules_;
+
   std::shared_ptr<Manage::WorkerChannel> channel_;
   IoOpPool io_ops_;
+  ObjectPool<std::array<std::byte, 16384>, 1024> tcp_buffer_pool;
+  ProvidedBufferPool<> tcp_provided_buffer_pool;
   uint64_t buf_for_signal{};
   bool is_running_{false};
   std::vector<Listener2> listeners_;

@@ -43,8 +43,8 @@ public:
       : fd(std::exchange(other.fd, -1)), ip_endpoint(other.ip_endpoint),
         is_raw(other.is_raw), support_http1(other.support_http1),
         support_http2(other.support_http2), is_quic(other.is_quic),
-        protocol(other.protocol), hash_upstream_pool(other.hash_upstream_pool),
-        hash_route(other.hash_route), redirect_to_port(other.redirect_to_port) {
+        protocol(other.protocol), name_upstream_pool(other.name_upstream_pool),
+        name_route(other.name_route), redirect_to_port(other.redirect_to_port) {
   }
 
   ~Listener2() {
@@ -207,10 +207,10 @@ private:
     listener.support_http1 = support_http1;
     listener.support_http2 = support_http2;
     listener.protocol = TransportProtocol::Tcp;
+    listener.tls_path = config.tls;
 
-    listener.hash_upstream_pool =
-        std::hash<std::string>{}(config.upstream_pool);
-    listener.hash_route = std::hash<std::string>{}(config.route);
+    listener.name_upstream_pool = config.upstream_pool;
+    listener.name_route = config.route;
 
     return listener;
   }
@@ -222,9 +222,10 @@ private:
   bool support_http1{false};
   bool support_http2{false};
   bool is_quic{false};
+  std::string tls_path{false};
   TransportProtocol protocol;
-  size_t hash_upstream_pool;
-  size_t hash_route;
+  std::string name_upstream_pool;
+  std::string name_route;
   int redirect_to_port;
 };
 } // namespace Coring4

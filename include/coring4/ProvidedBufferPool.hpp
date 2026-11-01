@@ -16,7 +16,7 @@ public:
   // static constexpr auto RING_MASK = NUM_BUFFERS - 1;
 
 private:
-  std::vector<BufferHandle16> pool_bufs_; // temp
+  std::vector<std::byte *> pool_bufs_; // temp
   io_uring_buf_ring *buf_ring_{nullptr};
   std::size_t ring_size_bytes_{0};
   uint16_t bgid_{0};
@@ -57,9 +57,9 @@ public:
     return true;
   }
 
-  void recycle_buffer(BufferHandle16 handle, uint16_t bid) noexcept {
-    pool_bufs_[bid] = handle;
-    io_uring_buf_ring_add(buf_ring_, handle.as_raw(), pool_bufs_.size(), bid,
+  void recycle_buffer(std::byte *data, uint16_t bid) noexcept {
+    pool_bufs_[bid] = data;
+    io_uring_buf_ring_add(buf_ring_, data, pool_bufs_.size(), bid,
                           io_uring_buf_ring_mask(pool_bufs_.size()),
                           recycle_count_++);
   }
@@ -69,7 +69,7 @@ public:
     }
   }
 
-  BufferHandle16 get_by_bid(uint16_t bid) noexcept { return pool_bufs_[bid]; }
+  std::byte *get_by_bid(uint16_t bid) noexcept { return pool_bufs_[bid]; }
 
   auto get_bgid() const noexcept { return bgid_; }
 };
