@@ -1,0 +1,36 @@
+# Coring5 example configuration. See docs/CONFIG_AND_RELOAD.md.
+#
+# [runtime]  fixed for the process lifetime: changing it needs a restart
+#            (a reload that touches it is rejected, the old config keeps running).
+# [limits] and [[listener]]  are hot-reloadable (SIGHUP or `coringctl reload`).
+
+[runtime]
+workers = 2 # one thread (and one io_uring) per worker
+# cpus = [2, 3]                   # pin worker i to cpus[i]; omit to not pin
+max_connections_per_worker = 10000
+buffer_count = 1024                # power of two; provided-buffer ring entries
+buffer_size = 16384
+ring_sq_entries = 2048             # powers of two, cq >= sq
+ring_cq_entries = 8192
+tick_ms = 50                       # timer wheel resolution
+drain_timeout_ms = 10000           # graceful shutdown deadline
+reload_ack_timeout_ms = 5000
+
+[limits]
+idle_timeout_ms = 60000
+header_timeout_ms = 10000
+connect_timeout_ms = 3000
+keepalive_timeout_ms = 60000
+max_head_bytes = 16384
+max_headers = 100
+max_uri_bytes = 8192
+queue_high_watermark = 262144
+queue_low_watermark = 65536
+
+# In this skeleton only protocol = "echo" is implemented (milestone M1/M2).
+# "l4", "http1", "http2", "http3" are accepted by the parser and rejected by the
+# validator until their milestones land.
+[[listener]]
+name = "echo"
+address = "127.0.0.1:8080"
+protocol = "echo"

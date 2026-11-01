@@ -1,0 +1,44 @@
+[Unit]
+Description=Coring5 proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/sbin/coringd --config /etc/coring/coring.toml --check-config
+ExecStart=/usr/sbin/coringd --config /etc/coring/coring.toml --control /run/coring/control.sock
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=1s
+TimeoutStopSec=30s
+
+User=coring
+Group=coring
+RuntimeDirectory=coring
+RuntimeDirectoryMode=0750
+
+# One fd per connection (+ upstream) per worker; size for your max connections.
+LimitNOFILE=1048576
+# io_uring pins locked memory for rings and buffer slabs on older kernels.
+LimitMEMLOCK=infinity
+
+# Bind to ports < 1024 without being root.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Hardening. NOTE: do not add a seccomp filter that blocks io_uring_setup,
+# io_uring_enter or io_uring_register (docker's default profile does, which is
+# why containers need --security-opt seccomp=<profile allowing io_uring>).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+MemoryDenyWriteExecute=true
+
+[Install]
+WantedBy=multi-user.target
