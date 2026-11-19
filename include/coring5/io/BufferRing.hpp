@@ -13,6 +13,7 @@
 #include "coring5/base/Result.hpp"
 #include "coring5/io/Ring.hpp"
 #include "coring5/mem/Region.hpp"
+#include <cassert>
 #include <cstdint>
 #include <span>
 #include <utility>
@@ -56,6 +57,10 @@ public:
     }
     [[nodiscard]] uint32_t size() const noexcept { return len_; }
     [[nodiscard]] uint16_t id() const noexcept { return bid_; }
+    [[nodiscard]] uint32_t buf_size() const noexcept {
+      assert(ring_);
+      return ring_->buf_size();
+    }
 
     void release() noexcept {
       if (ring_ != nullptr) {

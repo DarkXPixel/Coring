@@ -68,6 +68,10 @@ Result<Endpoint> Endpoint::parse(std::string_view text) {
   return ep;
 }
 
+bool Endpoint::operator==(const Endpoint &o) const noexcept {
+  return len == o.len && std::memcmp(&addr, &o.addr, len) == 0;
+}
+
 uint16_t Endpoint::port() const noexcept {
   if (addr.ss_family == AF_INET) {
     return ntohs(reinterpret_cast<const sockaddr_in *>(&addr)->sin_port);

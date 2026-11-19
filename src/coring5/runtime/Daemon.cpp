@@ -52,10 +52,10 @@ std::string Daemon::reload() {
            "status)";
   }
   return std::format("OK generation={} listeners_added={} removed={} "
-                     "limits_changed={} acked={}",
+                     "limits_changed={} upstreams_changed={} acked={}",
                      r->generation, r->diff.added.size(),
                      r->diff.removed.size(), r->diff.limits_changed,
-                     r->workers_acked);
+                     r->diff.upstreams_changed, r->workers_acked);
 }
 
 std::string Daemon::stats() const { return render_metrics(workers_.metrics()); }

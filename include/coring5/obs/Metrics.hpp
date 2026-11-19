@@ -5,6 +5,7 @@
 // Shards are cache-line aligned so workers never false-share.
 
 #include "coring5/base/Result.hpp"
+#include "coring5/base/Types.hpp"
 #include <array>
 #include <atomic>
 #include <bit>
@@ -72,9 +73,13 @@ private:
 struct alignas(64) WorkerMetrics {
   Counter accepts{0};
   Counter accept_errors{0};
-  Counter conns_rejected{0}; // pool full, load shed
-  Counter conns_live{0};     // gauge
-  Counter stale_events{0};   // MUST stay 0 (invariant I4)
+  Counter conns_rejected{0}; // pool full, load shed (all pools)
+  Counter conns_live{0};     // gauge (all pools)
+  // Per connection pool, indexed by PoolId (rendered with a proto="..." label).
+  std::array<Counter, kPoolCount> pool_accepts{};
+  std::array<Counter, kPoolCount> pool_rejected{};
+  std::array<Counter, kPoolCount> pool_live{}; // gauge
+  Counter stale_events{0};                     // MUST stay 0 (invariant I4)
   Counter nobufs{0};
   Counter sq_full{0};
   Counter cq_overflow{0};
@@ -84,6 +89,16 @@ struct alignas(64) WorkerMetrics {
   Counter cqes{0};
   Counter buffers_free{0}; // gauge
   Counter config_generation{0};
+  // l4 relay (M3)
+  Counter upstream_connect_ok{0};
+  Counter upstream_connect_fail{0};
+  Counter upstream_retries{0};     // connect retried on another backend
+  Counter upstream_ejections{0};   // backends ejected by passive health
+  Counter upstream_panic_picks{0}; // all backends ejected: picked anyway
+  Counter relay_pauses{0};         // a direction hit its watermark
+  Counter relay_chunks_in_use{0};  // gauge
+  Counter relay_chunks_peak{0};    // gauge: high-water mark since start
+  Counter relay_shed{0};           // closed because the chunk pool was empty
   std::array<Counter, kErrcCount> closes{};
   Log2Histogram loop_ns;
 };

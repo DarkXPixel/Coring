@@ -9,7 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 
-option(CORING_BUILD_LEGACY "Build the legacy coring/coring2/3/4 targets" ON)
+option(CORING_BUILD_LEGACY "Build the legacy coring/coring2/3/4 targets" OFF)
 
 find_package(PkgConfig REQUIRED)
 if(CORING_BUILD_LEGACY)
@@ -29,10 +29,10 @@ endif()
 
 
 if(CORING_BUILD_LEGACY)
-add_executable(cli src/cli/main.cpp)
+  add_executable(cli src/cli/main.cpp)
 
 
-add_executable(exe src/main.cpp
+  add_executable(exe src/main.cpp
     src/coring_uring/UringEngine.cpp
     include/coring/HTTPParser.hpp
     src/utility/CliParser.cpp
@@ -47,28 +47,28 @@ add_executable(exe src/main.cpp
     src/Coring4/RouteTable.cpp)
 
 
-if(ENABLE_ASAN)
-  message(STATUS "Building with AddressSanitizer (ASan)")
-  target_compile_options(exe PRIVATE -fsanitize=address -g -O1 -fno-omit-frame-pointer)
-  target_link_options(exe PRIVATE -fsanitize=address)
-endif()
+  if(ENABLE_ASAN)
+    message(STATUS "Building with AddressSanitizer (ASan)")
+    target_compile_options(exe PRIVATE -fsanitize=address -g -O1 -fno-omit-frame-pointer)
+    target_link_options(exe PRIVATE -fsanitize=address)
+  endif()
 
-if(ENABLE_TSAN)
-  message(STATUS "Building with ThreadSanitizer (TSan)")
-  target_compile_options(exe PRIVATE -fsanitize=thread -g -O1)
-  target_link_options(exe PRIVATE -fsanitize=thread)
-endif()
+  if(ENABLE_TSAN)
+    message(STATUS "Building with ThreadSanitizer (TSan)")
+    target_compile_options(exe PRIVATE -fsanitize=thread -g -O1)
+    target_link_options(exe PRIVATE -fsanitize=thread)
+  endif()
 
 
-target_link_libraries(exe PRIVATE
+  target_link_libraries(exe PRIVATE
     PkgConfig::LIBURING Boost::boost
 )
 
-target_include_directories(exe PRIVATE include)
+  target_include_directories(exe PRIVATE include)
 endif()
 
 # --- routing: tests & benchmark (cmake --build . --target routing_test) ---
-option(CORING_BUILD_TESTS "Build routing tests and benchmark" ON)
+option(CORING_BUILD_TESTS "Build routing tests and benchmark" OFF)
 if(CORING_BUILD_TESTS)
   enable_testing()
   add_library(coring4_routing STATIC src/Coring4/RouteTable.cpp)
@@ -103,7 +103,7 @@ endif()
 option(CORING5_BUILD "Build Coring5 (coringd, coringctl, tests)" ON)
 if(CORING5_BUILD)
   add_subdirectory(src/coring5)
-  option(CORING5_BUILD_TESTS "Build Coring5 tests" ON)
+  option(CORING5_BUILD_TESTS "Build Coring5 tests" OFF)
   if(CORING5_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests/coring5)

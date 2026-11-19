@@ -13,6 +13,9 @@ Result<Region> Region::map(std::size_t bytes, RegionOptions opts) {
   if (opts.populate) {
     flags |= MAP_POPULATE;
   }
+  if (opts.noreserve) {
+    flags |= MAP_NORESERVE;
+  }
   void *p = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, flags, -1, 0);
   if (p == MAP_FAILED) {
     return unexpected_error(Errc::Overloaded, errno);

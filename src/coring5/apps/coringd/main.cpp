@@ -9,6 +9,7 @@
 //   SIGHUP          reload configuration
 
 #include "coring5/runtime/Daemon.hpp"
+
 #include <csignal>
 #include <cstdio>
 #include <cstring>

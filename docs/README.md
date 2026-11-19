@@ -20,20 +20,23 @@ its design; the code under `include/coring5` and `src/coring5` implements it.
 
 **This is a skeleton, not a finished proxy.** Be precise about what exists:
 
-| Area                                                                     | State                                                                          |
-| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------ |
-| `base`, `mem`, `io` (Ring, BufferRing, TimerWheel, Connection lifecycle) | Implemented and tested                                                         |
-| `runtime` (Worker, WorkerGroup, Mailbox, ConfigManager, Daemon)          | Implemented and tested with the `echo` protocol                                |
-| `config` (TOML loader, validator, diff), hot reload                      | Implemented and tested, including reload under load                            |
-| `control` (admin socket) + `coringd` / `coringctl`                       | Implemented; blocking, one client at a time (see roadmap M2)                   |
-| `obs` (metrics shards, SPSC ring)                                        | Metrics implemented; access-log writer not yet                                 |
-| `proto/http1` head parser                                                | Implemented and fuzzed; body framing **not** implemented                       |
-| `proto/l4`                                                               | `EchoConnection` only (reference implementation); TCP relay is interface notes |
-| `upstream`, `tls`, `handlers`                                            | Interface/design notes only                                                    |
-| HTTP/2, UDP, HTTP/3                                                      | Not started                                                                    |
-| `routing`                                                                | Still lives in `include/coring4/routing`; migrates in M4                       |
+| Area                                                                   | State                                                                                                                                              |
+| ---------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base`, `mem`, `io` (Ring, BufferRing, TimerWheel, ConnCore, ConnPool) | Implemented and tested; no virtual dispatch, one typed pool per protocol                                                                           |
+| `runtime` (Worker, WorkerGroup, Mailbox, ConfigManager, Daemon)        | Implemented and tested with the `echo` protocol                                                                                                    |
+| `config` (TOML loader, validator, diff), hot reload                    | Implemented and tested, including reload under load                                                                                                |
+| `control` (admin socket) + `coringd` / `coringctl`                     | Implemented; blocking, one client at a time (see roadmap M2)                                                                                       |
+| `obs` (metrics shards, SPSC ring)                                      | Metrics implemented; access-log writer not yet                                                                                                     |
+| `proto/http1` head parser                                              | Implemented and fuzzed; body framing **not** implemented                                                                                           |
+| `proto/l4`, `proto/http1conn`, `proto/http2`, `proto/http3`            | `EchoConn` reference; `L4Conn`/`Http1Conn` operational stubs (listeners accepted); `Http2Conn`/`Http3Conn` stubs (pools exist, listeners rejected) |
+| `upstream`                                                             | Implemented (M3): `UpstreamPool` with RR/least-conn, passive ejection, panic mode, reload epochs                                                   |
+| `tls`, `handlers`                                                      | Interface/design notes only                                                                                                                        |
+| HTTP/2, UDP, HTTP/3                                                    | Not started                                                                                                                                        |
+| `routing`                                                              | Still lives in `include/coring4/routing`; migrates in M4                                                                                           |
 
-Only `protocol = "echo"` listeners are accepted by the config validator today.
+`echo`, `l4` and `http1` listeners are accepted by the config validator today
+(`l4` is the M3 TCP passthrough and needs an `upstream`; `http1` answers 501/400 and closes);
+`http2`/`http3` are rejected until M8/M10.
 
 ## Quick start
 

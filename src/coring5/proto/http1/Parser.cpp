@@ -56,6 +56,22 @@ std::string_view trim_ows(std::string_view v) {
 
 HeadResult fail(ParseError e) { return HeadResult{ParseStatus::Error, e, 0}; }
 
+constexpr bool is_token(std::string_view v) {
+  if (v.empty()) {
+    return false;
+  }
+  for (const char c : v) {
+    if (!is_tchar(static_cast<unsigned char>(c))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Request-target bytes: visible ASCII only. Controls, SP and DEL are rejected
+// earlier; bytes >= 0x80 are only legal inside header values.
+constexpr bool is_target_char(unsigned char c) { return c > 0x20 && c < 0x7F; }
+
 } // namespace
 
 std::string_view RequestHead::find(std::string_view lower_name) const noexcept {
@@ -85,7 +101,14 @@ HeadResult parse_head(std::span<const char> in, const Limits &limits,
     if (c == '\n' && (i == 0 || buf[i - 1] != '\r')) {
       return fail(ParseError::BareLf);
     }
-    if (c == '\0' || (c < 0x20 && c != '\r' && c != '\n' && c != '\t')) {
+    // A CR must be the first half of CRLF. The check looks only at bytes inside
+    // the scanned window, so the verdict never depends on segmentation: a CR
+    // that ends the window is judged once its successor arrives.
+    if (c == '\r' && i + 1 < scan && buf[i + 1] != '\n') {
+      return fail(ParseError::BareCr);
+    }
+    if (c == '\0' || c == 0x7F ||
+        (c < 0x20 && c != '\r' && c != '\n' && c != '\t')) {
       return fail(ParseError::BadHeader);
     }
   }
@@ -130,11 +153,15 @@ HeadResult parse_head(std::span<const char> in, const Limits &limits,
   if (out.target.size() > limits.max_uri_bytes) {
     return fail(ParseError::UriTooLong);
   }
+  if (!std::ranges::all_of(out.target, [](char c) {
+        return is_target_char(static_cast<unsigned char>(c));
+      })) {
+    return fail(ParseError::BadRequestLine);
+  }
   if (version == "HTTP/1.1") {
     out.minor_version = 1;
   } else if (version == "HTTP/1.0") {
     out.minor_version = 0;
-    out.keep_alive = false;
   } else {
     return fail(ParseError::BadVersion);
   }
@@ -142,6 +169,9 @@ HeadResult parse_head(std::span<const char> in, const Limits &limits,
   // ---- headers ----
   const std::size_t max_headers =
       std::min<std::size_t>(limits.max_headers, kMaxHeadersHard);
+  bool seen_host = false;
+  bool saw_close = false;
+  bool saw_keep_alive = false;
   while (!head.empty()) {
     const std::size_t eol = head.find("\r\n");
     const std::string_view h = head.substr(0, eol);
@@ -189,12 +219,39 @@ HeadResult parse_head(std::span<const char> in, const Limits &limits,
       }
       out.chunked = true;
     } else if (iequals(name, "host")) {
+      // Two Host headers are a routing-confusion vector between the proxy and
+      // the upstream: reject even when the values are identical.
+      if (seen_host) {
+        return fail(ParseError::DuplicateHost);
+      }
+      seen_host = true;
       out.host = value;
     } else if (iequals(name, "connection")) {
-      if (iequals(value, "close")) {
-        out.keep_alive = false;
-      } else if (iequals(value, "keep-alive")) {
-        out.keep_alive = true;
+      // RFC 9110 7.6.1: a comma-separated list of tokens, possibly spread over
+      // several header lines. Empty list elements are tolerated.
+      std::string_view rest = value;
+      while (!rest.empty()) {
+        const std::size_t comma = rest.find(',');
+        const std::string_view tok = trim_ows(rest.substr(0, comma));
+        rest = comma == std::string_view::npos ? std::string_view{}
+                                               : rest.substr(comma + 1);
+        if (tok.empty()) {
+          continue;
+        }
+        if (!is_token(tok)) {
+          return fail(ParseError::BadHeaderValue);
+        }
+        if (out.connection_token_count >= kMaxConnectionTokens) {
+          return fail(ParseError::TooManyHeaders);
+        }
+        out.connection_tokens[out.connection_token_count++] = tok;
+        if (iequals(tok, "close")) {
+          saw_close = true;
+        } else if (iequals(tok, "keep-alive")) {
+          saw_keep_alive = true;
+        } else if (iequals(tok, "upgrade")) {
+          out.upgrade = true;
+        }
       }
     }
   }
@@ -202,6 +259,11 @@ HeadResult parse_head(std::span<const char> in, const Limits &limits,
   if (out.chunked && out.has_content_length) {
     return fail(ParseError::ConflictingLength); // classic smuggling vector
   }
+  if (out.minor_version == 1 && out.host.empty()) {
+    return fail(ParseError::MissingHost); // RFC 9112 3.2: exactly one Host
+  }
+  // `close` always wins; HTTP/1.0 persists only on an explicit keep-alive.
+  out.keep_alive = !saw_close && (out.minor_version == 1 || saw_keep_alive);
   // TODO(M4): body framing for requests (chunked decoder state machine).
   return HeadResult{ParseStatus::Done, ParseError::None, head_len};
 }

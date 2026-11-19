@@ -17,6 +17,10 @@ struct Endpoint {
   // "1.2.3.4:80", "[::1]:80", ":80" (= 0.0.0.0:80)
   [[nodiscard]] static Result<Endpoint> parse(std::string_view text);
 
+  // Same family, address and port. Endpoint::parse zero-initialises the
+  // storage, so comparing the first `len` bytes is exact.
+  [[nodiscard]] bool operator==(const Endpoint &o) const noexcept;
+
   [[nodiscard]] int family() const noexcept { return addr.ss_family; }
   [[nodiscard]] uint16_t port() const noexcept;
   [[nodiscard]] std::string to_string() const;

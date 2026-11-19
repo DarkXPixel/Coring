@@ -5,7 +5,9 @@
 // STATUS: the HEAD parser is implemented and strict; body framing (chunked
 // decoder, Content-Length tracking) is TODO(M4). Strictness policy (request
 // smuggling defence): REJECT, never normalise:
-//   * bare LF, NUL, control characters, obs-fold, whitespace before ':'
+//   * bare LF, bare CR, NUL, DEL, control characters, obs-fold, whitespace
+//     before ':'; bytes >= 0x80 are allowed only inside header VALUES
+//   * duplicate Host, and a missing/empty Host on HTTP/1.1
 //   * Content-Length + Transfer-Encoding together, duplicate/conflicting CL
 //   * Transfer-Encoding other than exactly "chunked"
 //   * request target / header count / head size over the configured limits
@@ -40,6 +42,9 @@ enum class ParseError : uint8_t {
   ConflictingLength,
   BadTransferEncoding,
   BadContentLength,
+  BareCr,
+  DuplicateHost,
+  MissingHost,
 };
 
 struct Header {
@@ -48,6 +53,9 @@ struct Header {
 };
 
 inline constexpr std::size_t kMaxHeadersHard = 128;
+// Distinct tokens remembered from all `Connection` headers (they name the
+// hop-by-hop headers a proxy must strip). More than this is rejected.
+inline constexpr std::size_t kMaxConnectionTokens = 8;
 
 struct RequestHead {
   std::string_view method;
@@ -59,8 +67,14 @@ struct RequestHead {
   bool chunked{false};
   bool has_content_length{false};
   uint64_t content_length{0};
+  // Effective persistence: HTTP/1.1 stays open unless a `close` token is
+  // present; HTTP/1.0 closes unless a `keep-alive` token is present.
   bool keep_alive{true};
+  bool upgrade{false}; // `upgrade` token present in Connection
   std::string_view host;
+  // Every token of every `Connection` header, in order (views into the input).
+  std::array<std::string_view, kMaxConnectionTokens> connection_tokens;
+  std::size_t connection_token_count{0};
 
   [[nodiscard]] std::string_view
   find(std::string_view lower_name) const noexcept;

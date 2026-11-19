@@ -46,4 +46,64 @@ enum class ApplicationProtocol : uint8_t { L4, Http1, Http2, Quic };
 // the skeleton; the rest are filled in by milestones M3/M4/M8/M10.
 enum class ProtocolKind : uint8_t { Echo, L4, Http1, Http2, Http3 };
 
+// One connection pool per worker for each connection type. The id travels in
+// the io_uring user_data (3 bits, see io/OpTag.hpp), hence at most 8 pools.
+enum class PoolId : uint8_t { Echo, L4, Http1, Http2, Http3, Count_ };
+
+inline constexpr std::size_t kPoolCount =
+    static_cast<std::size_t>(PoolId::Count_);
+static_assert(kPoolCount <= 8, "PoolId must fit in 3 bits of OpTag");
+
+[[nodiscard]] constexpr std::size_t pool_index(PoolId p) noexcept {
+  return static_cast<std::size_t>(p);
+}
+
+[[nodiscard]] constexpr PoolId pool_for(ProtocolKind k) noexcept {
+  switch (k) {
+  case ProtocolKind::Echo:
+    return PoolId::Echo;
+  case ProtocolKind::L4:
+    return PoolId::L4;
+  case ProtocolKind::Http1:
+    return PoolId::Http1;
+  case ProtocolKind::Http2:
+    return PoolId::Http2;
+  case ProtocolKind::Http3:
+    return PoolId::Http3;
+  }
+  return PoolId::Echo;
+}
+
+[[nodiscard]] constexpr const char *to_string(PoolId p) noexcept {
+  switch (p) {
+  case PoolId::Echo:
+    return "echo";
+  case PoolId::L4:
+    return "l4";
+  case PoolId::Http1:
+    return "http1";
+  case PoolId::Http2:
+    return "http2";
+  case PoolId::Http3:
+    return "http3";
+  case PoolId::Count_:
+    break;
+  }
+  return "unknown";
+}
+
+// What the worker knows about an accepted connection beyond its fd: which
+// listener accepted it and (for l4) which upstream it must be relayed to.
+// Plain ids, never pointers into a snapshot (invariant I8).
+struct AcceptInfo {
+  ListenerId listener{};
+  UpstreamId upstream{};
+};
+
+// A connection anywhere on this worker: which pool, and the slot inside it.
+struct ConnRef {
+  PoolId pool{PoolId::Echo};
+  Handle handle{};
+};
+
 } // namespace Coring5

@@ -29,11 +29,40 @@ ConfigManager::apply(ParsedConfig parsed) {
   if (workers_.size() != parsed.runtime.workers) {
     return std::unexpected("worker count mismatch");
   }
+  // Pools were sized from the FIRST configuration. Reject, before any worker
+  // is touched (invariant I5), a reload whose listeners do not fit them.
+  if (auto fit = check_pools_fit(have_runtime_ ? runtime_ : parsed.runtime,
+                                 parsed.listeners);
+      !fit) {
+    return std::unexpected(std::move(fit.error()));
+  }
 
   // 3. stable ids: same name AND address keep their id (and their sockets).
   auto next = std::make_shared<ConfigSnapshot>();
   next->limits = parsed.limits;
+  // Upstreams: the name is the identity, so an unchanged name keeps its id.
+  for (auto &u : parsed.upstreams) {
+    const UpstreamSpec *prev = nullptr;
+    if (current_) {
+      for (const auto &old : current_->upstreams) {
+        if (old.name == u.name) {
+          prev = &old;
+          break;
+        }
+      }
+    }
+    u.id = prev != nullptr ? prev->id : UpstreamId{next_upstream_id_++};
+    next->upstreams.push_back(std::move(u));
+  }
   for (auto &spec : parsed.listeners) {
+    if (!spec.upstream.empty()) {
+      for (const auto &u :
+           next->upstreams) { // validate_config checked it exists
+        if (u.name == spec.upstream) {
+          spec.upstream_id = u.id;
+        }
+      }
+    }
     const ListenerSpec *prev = nullptr;
     if (current_) {
       for (const auto &old : current_->listeners) {
@@ -98,7 +127,9 @@ ConfigManager::apply(ParsedConfig parsed) {
   // 8. retire the old snapshot on THIS thread.
   auto old = std::move(current_);
   current_ = std::move(next);
-  runtime_ = parsed.runtime;
+  if (!have_runtime_) {
+    runtime_ = parsed.runtime; // keeps the pool capacities workers started with
+  }
   have_runtime_ = true;
   ++next_generation_;
   old.reset();

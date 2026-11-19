@@ -79,6 +79,8 @@ public:
   [[nodiscard]] bool poll_multishot(int fd, OpTag tag) noexcept;
   // Single-shot recv into a buffer chosen from provided-buffer group `bgid`.
   [[nodiscard]] bool recv_provided(int fd, uint16_t bgid, OpTag tag) noexcept;
+  // Single-shot recv into caller-owned memory (must outlive the operation).
+  [[nodiscard]] bool recv(int fd, void *buf, uint32_t len, OpTag tag) noexcept;
   // Multishot variant. Ends with a CQE lacking F_MORE (e.g. -ENOBUFS).
   [[nodiscard]] bool recv_multishot_provided(int fd, uint16_t bgid,
                                              OpTag tag) noexcept;
@@ -86,24 +88,32 @@ public:
                           OpTag tag) noexcept;
   [[nodiscard]] bool send_zc(int fd, const void *buf, uint32_t len,
                              OpTag tag) noexcept;
-  // The kernel_timespec must outlive the operation.
   [[nodiscard]] bool connect(int fd, const sockaddr *sa, socklen_t len,
                              OpTag tag) noexcept;
-  // Links a timeout to the previously prepared SQE. Costs a second SQE and a
-  // second CQE (both must be counted as in-flight).
-  [[nodiscard]] bool link_timeout(const __kernel_timespec *ts,
-                                  OpTag tag) noexcept;
+  // connect + IORING_OP_LINK_TIMEOUT as ONE atomic unit: either both SQEs are
+  // queued adjacent and linked (returns true; the caller must count TWO
+  // in-flight operations, each producing its own CQE), or nothing was queued
+  // (returns false; count nothing). The kernel_timespec and the sockaddr must
+  // outlive the operation.
+  [[nodiscard]] bool connect_with_timeout(int fd, const sockaddr *sa,
+                                          socklen_t len,
+                                          const __kernel_timespec *ts,
+                                          OpTag connect_tag,
+                                          OpTag timeout_tag) noexcept;
+  // IORING_OP_SHUTDOWN: half-close (`how` = SHUT_WR etc.). Has its own CQE.
+  [[nodiscard]] bool shutdown(int fd, int how, OpTag tag) noexcept;
   [[nodiscard]] bool timeout(const __kernel_timespec *ts, OpTag tag) noexcept;
   // Cancels every pending request on `fd`. The cancel has its own CQE.
   [[nodiscard]] bool cancel_fd(int fd, OpTag tag) noexcept;
-
-  // Marks the previous SQE as linked to the next (IOSQE_IO_LINK).
-  void link_previous() noexcept;
 
   // Submits pending SQEs and waits for at least `min_complete` CQEs.
   [[nodiscard]] Result<unsigned>
   submit_and_wait(unsigned min_complete) noexcept;
   [[nodiscard]] Result<unsigned> submit() noexcept;
+  // Asks the kernel to run deferred task work and flush CQ-overflow entries
+  // into the CQ. Used after EBUSY from submit_and_wait: without it the reap
+  // that follows could see an empty CQ forever (livelock). Errors are ignored.
+  void flush_events() noexcept;
 
   // Invokes f(const Cqe&) for every ready CQE, then advances once.
   template <class F> unsigned reap(F &&f) {
@@ -124,7 +134,6 @@ public:
 private:
   Ring() = default;
   io_uring_sqe *sqe() noexcept;
-  io_uring_sqe *last_sqe_{nullptr};
 
   io_uring ring_{};
   RingCaps caps_{};

@@ -29,7 +29,9 @@ flowchart TD
   handlers --> proto_http1
   handlers --> upstream
   proto_l4 --> io
+  proto_l4 --> net
   net --> io
+  net --> upstream
   io --> mem
   io --> config
   io --> obs
@@ -38,22 +40,25 @@ flowchart TD
   config --> base
   obs --> base
   upstream --> base
+  upstream --> config
   tls --> base
 ```
 
-| Module | Responsibility | Depends on kernel `io_uring`? |
-|---|---|---|
-| `base` | `Result`/`Error`, `Handle`, `Endpoint`, `ReloadAck`, time types | no |
-| `mem` | `HandlePool` (generation handles), `Region` (mmap slab) | no |
-| `config` | Snapshot types, TOML loader, validator, diff | **no** (testable anywhere) |
-| `obs` | Per-worker metric shards, histograms, SPSC ring, access-log record | no |
-| `io` | `Ring`, `BufferRing`, `OpTag`, `TimerWheel`, `Connection`, `IoContext` | yes |
-| `net` | Listening-socket creation (control thread) | no (plain sockets) |
-| `proto/http1` | Sans-IO request-head parser (body framing: M4) | no |
-| `proto/l4` | `EchoConnection` (reference); TCP/UDP relay (M3/M9) | via `io` |
-| `upstream`, `tls`, `handlers` | Design stubs for M3/M4/M5 | – |
-| `control` | Unix-socket admin server | no |
-| `runtime` | `Worker`, `WorkerGroup`, `Mailbox`, `ConfigManager`, `Daemon` | via `io` |
+| Module                                          | Responsibility                                                                      | Depends on kernel `io_uring`? |
+| ----------------------------------------------- | ----------------------------------------------------------------------------------- | ----------------------------- |
+| `base`                                          | `Result`/`Error`, `Handle`, `Endpoint`, `ReloadAck`, time types                     | no                            |
+| `mem`                                           | `HandlePool` (generation handles), `Region` (mmap slab)                             | no                            |
+| `config`                                        | Snapshot types, TOML loader, validator, diff                                        | **no** (testable anywhere)    |
+| `obs`                                           | Per-worker metric shards, histograms, SPSC ring, access-log record                  | no                            |
+| `io`                                            | `Ring`, `BufferRing`, `OpTag`, `TimerWheel`, `ConnCore`, `ConnPool<T>`, `IoContext` | yes                           |
+| `net`                                           | Listening sockets (control thread); `UpstreamDialer` (worker: pick + connect + retry) | `UpstreamDialer` only         |
+| `proto/http1`                                   | Sans-IO request-head parser (body framing: M4)                                      | no                            |
+| `proto/l4`                                      | `EchoConn` (reference), `L4Conn` + `RelayQueue` (TCP relay, M3); UDP relay (M9)     | via `io`                      |
+| `proto/http1conn`, `proto/http2`, `proto/http3` | `Http1Conn` (answers 501/400), `Http2Conn`, `Http3Conn` operational stubs           | via `io`                      |
+| `upstream`                                      | `UpstreamPool`: backend pick, passive health, reload epochs (M3)                    | no                            |
+| `tls`, `handlers`                               | Design stubs for M4/M5                                                              | –                             |
+| `control`                                       | Unix-socket admin server                                                            | no                            |
+| `runtime`                                       | `Worker`, `WorkerGroup`, `Mailbox`, `ConfigManager`, `Daemon`                       | via `io`                      |
 
 `config` and `proto/http1` deliberately do not depend on `io`: parsing and
 validation are pure data transforms and are unit-tested/fuzzed without a ring.
@@ -72,19 +77,19 @@ ConfigManager: parse, validate,          HandlePool<Connection>, HandlePool<List
         └──────────────────────────────────┘   WorkerMetrics shard (single writer)
 ```
 
-* **Workers share nothing mutable.** Cross-thread edges: the mailbox
+- **Workers share nothing mutable.** Cross-thread edges: the mailbox
   (control→worker, cold), `ReloadAck` (worker→control), and metric shards
   (single writer per shard, relaxed atomics, read by the control thread).
-* **All fallible work happens on the control thread** (invariant I5): parsing,
+- **All fallible work happens on the control thread** (invariant I5): parsing,
   validation, DNS (future), certificate loading (future), `socket/bind/listen`.
   A worker's `ApplyConfig` handler cannot fail halfway.
-* **Startup is two-phase.** `WorkerGroup::start()` creates each `Worker` *on its
-  own thread* (invariant I1), waits for every `init()` result, and only then
+- **Startup is two-phase.** `WorkerGroup::start()` creates each `Worker` _on its
+  own thread_ (invariant I1), waits for every `init()` result, and only then
   releases all workers to run. If any worker fails (pin, ring, buffer ring) all
   threads are joined and the first error is returned.
-* **Signals** are blocked in every worker thread and handled by the main thread
+- **Signals** are blocked in every worker thread and handled by the main thread
   through `signalfd`.
-* A helper thread for slow work (TLS handshakes, cold `open/stat`) is *not*
+- A helper thread for slow work (TLS handshakes, cold `open/stat`) is _not_
   added speculatively. Add it only when the loop-stall histogram
   (`coring_loop_ns_p999_upper_bound_max`) says it is needed, and document the
   exception.
@@ -106,22 +111,24 @@ run():   loop:
            metrics: loop_iterations, buffers_free, sq_full, cq_overflow, loop_ns
 ```
 
-Dispatch is one switch on `OpTag::kind()`; connection CQEs then do one lookup
-`HandlePool::get(handle)` and one virtual call `Connection::handle_cqe`. A
-failed lookup increments `stale_events`, which must stay at 0 (see INVARIANTS.md).
+Dispatch is one switch on `OpTag::kind()`; connection CQEs then switch on
+`OpTag::pool()` into a statically typed `ConnPool<T>`, which does one lookup
+`HandlePool::get(handle)` and calls `T::on_cqe` directly (no virtual calls).
+A failed lookup increments `stale_events`, which must stay at 0 (see
+INVARIANTS.md).
 
 ### Completion tag (`io/OpTag.hpp`)
 
 ```
-63            32 31          12 11      6 5       0
-+---------------+--------------+---------+--------+
-|      gen      |    index     |  kind   |  aux   |   explicit shifts, not bit-fields
-+---------------+--------------+---------+--------+   (bit-field layout is implementation-defined)
+63            32 31          12 11      6 5     3 2     0
++---------------+--------------+---------+-------+-------+
+|      gen      |    index     |  kind   | pool  |  aux  |   explicit shifts, not bit-fields
++---------------+--------------+---------+-------+-------+   (bit-field layout is implementation-defined)
 ```
 
-Capacity is therefore ≤ 2^20 slots per pool. `aux` distinguishes e.g. a
-connection's own cancel (`kAuxConnection`) from a listener removal cancel
-(`kAuxWorker`).
+Capacity is therefore ≤ 2^20 slots per pool, with at most 8 pools (`PoolId`:
+echo, l4, http1, http2, http3). `aux` (0..7) distinguishes e.g. a connection's
+own cancel (`kAuxConnection`) from a listener removal cancel (`kAuxWorker`).
 
 ### Connection lifecycle (`io/Connection.hpp`)
 
@@ -135,40 +142,60 @@ stateDiagram-v2
   Closed --> [*]: Worker::reap_closed() destroys the slot
 ```
 
-Derived classes (`EchoConnection`, future HTTP/L4 sessions) implement `start`,
-`on_cqe`, `on_timer`, `on_drain` and wrap *every* ring submission in
-`counted(...)`. The base class owns the fd, the timer node, the in-flight
+There is **no polymorphic base class**. Each connection type (`EchoConn`,
+`L4Conn`, `Http1Conn`, `Http2Conn`, `Http3Conn`) embeds a public `ConnCore
+core` and provides `start`, `on_cqe`, `on_timer`, `on_drain` (checked by the
+`ConnectionType` concept), wrapping _every_ ring submission in
+`core.counted(...)`. `ConnCore` owns the fd, the timer node, the in-flight
 counter and the close sequence (cancel → wait → close). Details and rationale
 in INVARIANTS.md (I2, I3).
 
+```
+Worker ── ConnPools ──┬─ ConnPool<EchoConn>   capacity = pool_capacity[echo]
+                      ├─ ConnPool<L4Conn>     ... [l4]
+                      ├─ ConnPool<Http1Conn>  ... [http1]
+                      ├─ ConnPool<Http2Conn>  ... [http2]
+                      └─ ConnPool<Http3Conn>  ... [http3]
+```
+
+Pool capacities are derived from the loaded configuration (listeners'
+`max_connections`, optional `[runtime.pools]`, shared
+`max_connections_per_worker` budget; see CONFIG_AND_RELOAD.md) and are fixed
+at startup. A protocol with no listener has capacity 0 and allocates nothing.
+
 ## 5. Memory
 
-* **No allocation on the data path** (I7). `HandlePool` has fixed capacity and
+- **No allocation on the data path** (I7). `HandlePool` has fixed capacity and
   returns `{invalid, nullptr}` when full; the worker counts
   `conns_rejected` and closes the accepted fd (load shedding).
-* **Provided buffers.** One `mmap` slab (`Region`, pre-faulted on the worker
+- **Provided buffers.** One `mmap` slab (`Region`, pre-faulted on the worker
   thread so pages are first-touched on its NUMA node, `MADV_HUGEPAGE` best
   effort). `buffer id → address` is `base + bid * buf_size`. `recycle()` passes
-  the real buffer size as the length (the Coring4 pool passed the buffer *count*).
-* **Leases.** `BufferRing::Lease` is a move-only RAII handle that recycles on
+  the real buffer size as the length (the Coring4 pool passed the buffer _count_).
+- **Leases.** `BufferRing::Lease` is a move-only RAII handle that recycles on
   destruction; `publish()` makes recycled buffers visible once per loop
   iteration. Never hold a lease across an idle period (I10).
-* **Connection slots** are fixed-size (`kConnectionSlotBytes = 512`); a derived
-  class that does not fit fails a `static_assert`.
-* **Timers** are intrusive (`TimerNode` embedded in the connection): scheduling
+- **Connection slots** are exactly `sizeof(T)` of their pool's type, so a
+  small type never pays for the largest one.
+- **Timers** are intrusive (`TimerNode` embedded in the connection): scheduling
   never allocates and a destroyed connection can't leave a stale timer behind.
 
 ## 6. Error model
 
-* `Result<T> = std::expected<T, Error>` with `Error{Errc code; int sys;}` (8
+- `Result<T> = std::expected<T, Error>` with `Error{Errc code; int sys;}` (8
   bytes, trivially copyable) on the data path. No exceptions on workers.
-* Cold paths (config, startup) return human-readable `std::string` errors.
-* Classes: programmer error → `assert`; per-connection error → close with a
+- Cold paths (config, startup) return human-readable `std::string` errors.
+- Classes: programmer error → `assert`; per-connection error → close with a
   labelled reason (`closes{reason=...}` metric); per-worker exhaustion → shed
   load; unrecoverable ring failure → `std::terminate()` so the supervisor
   restarts the process (the only remaining `terminate` in `Worker::run`).
 
 ## 7. Planned data path (HTTP/1.1 reverse proxy, M4)
+
+> The sketch below is the H1-only view. The proposed generalization across
+> H1/H2/H3, TLS and static files (neutral Exchange layer, session lifecycles)
+> is the draft [ADR 0010](adr/0010-m4-exchange-layer-sessions-tls-static.md);
+> nothing in it is implemented.
 
 ```mermaid
 flowchart TD
@@ -193,15 +220,15 @@ Each byte stream `src → dst` goes through one bounded queue with high/low
 watermarks (`limits.queue_high_watermark` / `queue_low_watermark`, replacing
 the three conflicting constants in Coring4). Rules the relay must follow:
 
-* Pausing a multishot recv is asynchronous; data may still arrive after the
+- Pausing a multishot recv is asynchronous; data may still arrive after the
   decision to pause and must be accepted, not dropped. (Single-shot recv per
   direction in streaming phases gives natural backpressure.)
-* `-ENOBUFS` on a recv means "buffer ring empty": treat as "retry later /
+- `-ENOBUFS` on a recv means "buffer ring empty": treat as "retry later /
   shed", not as a protocol error.
-* Half-close: EOF on one side ⇒ flush the queue, `shutdown(SHUT_WR)` on the
+- Half-close: EOF on one side ⇒ flush the queue, `shutdown(SHUT_WR)` on the
   other; close when both directions are done.
-* Short sends are normal; `EchoConnection` shows the loop.
-* Zero-copy: `SEND_ZC` yields two CQEs (result with `F_MORE`, then `F_NOTIF`);
+- Short sends are normal; `EchoConnection` shows the loop.
+- Zero-copy: `SEND_ZC` yields two CQEs (result with `F_MORE`, then `F_NOTIF`);
   the buffer and the connection must stay alive until the second. Make the
   threshold configurable and benchmark it (loopback falls back to copying).
   `io_uring` has no `sendfile` opcode: static files use `splice(file→pipe→socket)`
@@ -211,20 +238,24 @@ the three conflicting constants in Coring4). Rules the relay must follow:
 
 Parsers and framers are **sans-IO**: bytes in, events out, no sockets.
 
-* **HTTP/1.1** (`proto/http1`): implemented head parser is strict by policy —
-  it *rejects* (never normalizes) bare LF, NUL/control characters, obs-fold,
+- **HTTP/1.1** (`proto/http1`): implemented head parser is strict by policy —
+  it _rejects_ (never normalizes) bare LF, NUL/control characters, obs-fold,
   whitespace before `:`, CL+TE together, duplicate/conflicting
   `Content-Length`, `Transfer-Encoding` other than exactly `chunked`, and
   head/URI/header-count over limits. Strings in `RequestHead` point into the
   caller's buffer. Body framing and the response side are M4.
-* **HTTP/2** (M8): nghttp2 adapter; stream flow control mapped to the relay
+- **HTTP/2** (M8): nghttp2 adapter; stream flow control mapped to the relay
   watermarks; limits for rapid-reset, CONTINUATION floods, HPACK size.
-* **HTTP/3** (M10): ngtcp2 + nghttp3, UDP GSO/GRO, multishot `recvmsg`; encode
+- **HTTP/3** (M10): ngtcp2 + nghttp3, UDP GSO/GRO, multishot `recvmsg`; encode
   the worker id in the connection ID and steer with a reuseport eBPF program,
   because QUIC connections migrate between 4-tuples.
-* **TLS** (M5): OpenSSL with memory BIOs; the library never touches the socket.
+- **TLS** (M5): OpenSSL with memory BIOs; the library never touches the socket.
   `SSL_CTX` objects are built on the control thread and shared read-only.
-* **L4** (M3/M9): see `proto/l4/TcpRelay.hpp` for the design notes.
+- **L4** (M3): implemented; see `proto/l4/TcpRelay.hpp` and ADR 0009. UDP is M9.
+  ADR 0009 covers L4 passthrough only. HTTP/1/2/3 upstream session pooling, the
+  protocol-neutral request/response relay layer, sans-IO TLS and static-file
+  bodies are designed in a separate ADR at the start of M4; they reuse
+  `UpstreamPool` (and probably `UpstreamDialer`) but not L4's ownership model.
 
 ## 9. Observability
 
@@ -238,9 +269,9 @@ latency with HDR histograms on the load generator (BENCHMARKING.md).
 
 ## 10. Security posture
 
-* Control socket: mode 0660 (created under `umask 0117`), `SO_PEERCRED` check
+- Control socket: mode 0660 (created under `umask 0117`), `SO_PEERCRED` check
   (same uid as the daemon or root), 1 s receive timeout.
-* Parser strictness as above; hard limits on head size, header count, URI.
-* systemd unit drops privileges, keeps only `CAP_NET_BIND_SERVICE`.
-* Planned (M7): per-IP connection limits, slowloris/header-bomb timeouts
+- Parser strictness as above; hard limits on head size, header count, URI.
+- systemd unit drops privileges, keeps only `CAP_NET_BIND_SERVICE`.
+- Planned (M7): per-IP connection limits, slowloris/header-bomb timeouts
   (`header_timeout_ms`), access-log ring.

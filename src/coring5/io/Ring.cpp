@@ -2,6 +2,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <liburing.h>
 #include <poll.h>
 #include <sys/utsname.h>
 
@@ -84,7 +85,6 @@ io_uring_sqe *Ring::sqe() noexcept {
     (void)io_uring_submit(&ring_); // drains the SQ into the kernel
     s = io_uring_get_sqe(&ring_);
   }
-  last_sqe_ = s;
   return s;
 }
 
@@ -117,6 +117,16 @@ bool Ring::recv_provided(int fd, uint16_t bgid, OpTag tag) noexcept {
   io_uring_prep_recv(s, fd, nullptr, 0, 0);
   s->flags |= IOSQE_BUFFER_SELECT;
   s->buf_group = bgid;
+  io_uring_sqe_set_data64(s, tag.raw);
+  return true;
+}
+
+bool Ring::recv(int fd, void *buf, uint32_t len, OpTag tag) noexcept {
+  io_uring_sqe *s = sqe();
+  if (s == nullptr) {
+    return false;
+  }
+  io_uring_prep_recv(s, fd, buf, len, 0);
   io_uring_sqe_set_data64(s, tag.raw);
   return true;
 }
@@ -164,16 +174,47 @@ bool Ring::connect(int fd, const sockaddr *sa, socklen_t len,
   return true;
 }
 
-bool Ring::link_timeout(const __kernel_timespec *ts, OpTag tag) noexcept {
-  io_uring_sqe *prev = last_sqe_;
+bool Ring::connect_with_timeout(int fd, const sockaddr *sa, socklen_t len,
+                                const __kernel_timespec *ts, OpTag connect_tag,
+                                OpTag timeout_tag) noexcept {
+  // The two SQEs must be adjacent in ONE submission: a link flag set on an SQE
+  // that a forced submit already handed to the kernel is silently ignored, and
+  // the connect would then run without its deadline. So make room for both
+  // BEFORE taking either (submitting first if needed), then prepare the pair.
+  if (io_uring_sq_space_left(&ring_) < 2) [[unlikely]] {
+    ++sq_full_;
+    (void)io_uring_submit(&ring_);
+    if (io_uring_sq_space_left(&ring_) < 2) {
+      return false; // nothing was prepared: caller must not count anything
+    }
+  }
+  io_uring_sqe *c = io_uring_get_sqe(&ring_);
+  io_uring_sqe *t = io_uring_get_sqe(&ring_);
+  if (c == nullptr || t == nullptr) [[unlikely]] {
+    // Cannot happen after the check above. If it ever did, `c` is a valid but
+    // unprepared SQE: turn it into a harmless NOP so the kernel never sees
+    // garbage, and report failure (the caller counts nothing, the stray NOP CQE
+    // carries a zero tag and is ignored by the worker).
+    if (c != nullptr) {
+      io_uring_prep_nop(c);
+      io_uring_sqe_set_data64(c, 0);
+    }
+    return false;
+  }
+  io_uring_prep_connect(c, fd, sa, len);
+  io_uring_sqe_set_data64(c, connect_tag.raw);
+  c->flags |= IOSQE_IO_LINK;
+  io_uring_prep_link_timeout(t, const_cast<__kernel_timespec *>(ts), 0);
+  io_uring_sqe_set_data64(t, timeout_tag.raw);
+  return true;
+}
+
+bool Ring::shutdown(int fd, int how, OpTag tag) noexcept {
   io_uring_sqe *s = sqe();
   if (s == nullptr) {
     return false;
   }
-  if (prev != nullptr) {
-    prev->flags |= IOSQE_IO_LINK;
-  }
-  io_uring_prep_link_timeout(s, const_cast<__kernel_timespec *>(ts), 0);
+  io_uring_prep_shutdown(s, fd, how);
   io_uring_sqe_set_data64(s, tag.raw);
   return true;
 }
@@ -198,15 +239,8 @@ bool Ring::cancel_fd(int fd, OpTag tag) noexcept {
   return true;
 }
 
-void Ring::link_previous() noexcept {
-  if (last_sqe_ != nullptr) {
-    last_sqe_->flags |= IOSQE_IO_LINK;
-  }
-}
-
 Result<unsigned> Ring::submit_and_wait(unsigned min_complete) noexcept {
   const int rc = io_uring_submit_and_wait(&ring_, min_complete);
-  last_sqe_ = nullptr;
   if (rc < 0) {
     return unexpected_error(Errc::Internal, -rc);
   }
@@ -215,12 +249,13 @@ Result<unsigned> Ring::submit_and_wait(unsigned min_complete) noexcept {
 
 Result<unsigned> Ring::submit() noexcept {
   const int rc = io_uring_submit(&ring_);
-  last_sqe_ = nullptr;
   if (rc < 0) {
     return unexpected_error(Errc::Internal, -rc);
   }
   return static_cast<unsigned>(rc);
 }
+
+void Ring::flush_events() noexcept { (void)io_uring_get_events(&ring_); }
 
 bool Ring::cq_overflowed() const noexcept {
   return (IO_URING_READ_ONCE(*ring_.sq.kflags) & IORING_SQ_CQ_OVERFLOW) != 0U;

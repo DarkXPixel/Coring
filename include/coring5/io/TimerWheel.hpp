@@ -2,7 +2,7 @@
 
 // Single-level hashed timer wheel with INTRUSIVE nodes (invariants I7, I9).
 //
-//  * Nodes live inside their owner (Connection), so scheduling never
+//  * Nodes live inside their owner (ConnCore), so scheduling never
 //    allocates and a destroyed owner cannot leave a stale entry behind: the
 //    node's destructor unlinks it.
 //  * Time is injected (advance(now)) so tests are deterministic.
@@ -47,6 +47,7 @@ public:
   }
 
   Handle owner{};
+  PoolId pool{PoolId::Echo}; // which worker pool `owner` indexes into
   DeadlineKind kind{DeadlineKind::Idle};
 
 private:

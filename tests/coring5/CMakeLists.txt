@@ -25,12 +25,15 @@ coring5_add_test(coring5_unit_timer  SOURCES unit/timer_wheel_test.cpp LIBS cori
 coring5_add_test(coring5_unit_config SOURCES unit/config_test.cpp LIBS coring5_config)
 coring5_add_test(coring5_unit_http1  SOURCES unit/http1_parser_test.cpp LIBS coring5_proto_http1)
 coring5_add_test(coring5_unit_obs    SOURCES unit/obs_test.cpp    LIBS coring5_obs)
+coring5_add_test(coring5_unit_relay  SOURCES unit/relay_test.cpp  LIBS coring5_proto_l4)
 
 # ---- integration tests (real io_uring + sockets) -----------------------------
 coring5_add_test(coring5_it_echo NEEDS_RING
   SOURCES integration/echo_test.cpp LIBS coring5_runtime)
 coring5_add_test(coring5_it_reload NEEDS_RING
   SOURCES integration/reload_test.cpp LIBS coring5_runtime)
+coring5_add_test(coring5_it_l4 NEEDS_RING
+  SOURCES integration/l4_test.cpp LIBS coring5_runtime)
 
 # ---- fuzzing (opt-in; needs clang + libFuzzer) ---------------------------------
 option(CORING5_FUZZ "Build libFuzzer targets (requires clang)" OFF)

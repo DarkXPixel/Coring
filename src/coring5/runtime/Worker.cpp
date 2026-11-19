@@ -1,6 +1,5 @@
 #include "coring5/runtime/Worker.hpp"
 
-#include "coring5/proto/l4/EchoConnection.hpp"
 #include <cerrno>
 #include <csignal>
 #include <format>
@@ -42,6 +41,8 @@ Worker::~Worker() {
   // Explicit order: connections (fds, timer nodes) first, ring last.
   connections_.reset();
   listeners_.reset();
+  upstreams_.reset();
+  chunks_ = ChunkPool{};
   ctx_.reset();
   timers_.reset();
   buffers_.reset();
@@ -96,19 +97,39 @@ std::expected<void, std::string> Worker::init() {
                                                &snapshot_->limits,
                                                Clock::now(),
                                                {}});
-  ctx_->closed.reserve(init_.runtime.max_connections_per_worker);
+
+  // l4 relay memory: one lazily-faulted slab per worker, only when an l4 pool
+  // exists. Bounded by construction (queues cannot exceed it).
+  upstreams_ = std::make_unique<UpstreamPool>();
+  if (init_.runtime.pool_capacity[pool_index(PoolId::L4)] > 0) {
+    const uint64_t n =
+        (static_cast<uint64_t>(init_.runtime.relay_memory_mib) << 20) /
+        init_.runtime.buffer_size;
+    auto cp =
+        ChunkPool::create(init_.runtime.buffer_size, static_cast<uint32_t>(n));
+    if (!cp) {
+      return std::unexpected(std::format(
+          "worker {}: relay chunk pool failed ({}, errno {})", init_.id.value,
+          to_string(cp.error().code), cp.error().sys));
+    }
+    chunks_ = std::move(*cp);
+  }
+  ctx_->upstreams = upstreams_.get();
+  ctx_->chunks = &chunks_;
 
   listeners_ =
       std::make_unique<HandlePool<ListenerSlot>>(kMaxListenersPerWorker);
-  connections_ = std::make_unique<HandlePool<Connection, kConnectionSlotBytes>>(
-      init_.runtime.max_connections_per_worker);
+  // One pool per connection type, sized from the loaded configuration. A
+  // protocol without listeners gets capacity 0 and costs no memory.
+  connections_ = std::make_unique<ConnPools>(init_.runtime.pool_capacity);
+  ctx_->closed.reserve(connections_->total_capacity());
 
   tick_ts_ = to_timespec(init_.runtime.tick);
   arm_mailbox();
   arm_tick();
   if (!mailbox_armed_ || !tick_armed_) {
-    return std::unexpected(
-        std::format("worker {}: cannot queue initial ring operations", init_.id.value));
+    return std::unexpected(std::format(
+        "worker {}: cannot queue initial ring operations", init_.id.value));
   }
   set(init_.metrics->buffers_free, buffers_->free_count());
   initialized_ = true;
@@ -133,11 +154,16 @@ void Worker::run() {
   while (!done_) {
     auto r = ring_->submit_and_wait(1);
     if (!r) {
-      if (r.error().sys == EINTR || r.error().sys == EBUSY ||
-          r.error().sys == EAGAIN) {
-        continue;
+      const int err = r.error().sys;
+      if (err != EINTR && err != EBUSY && err != EAGAIN) {
+        std::terminate(); // unrecoverable ring failure: supervisor restarts us
       }
-      std::terminate(); // unrecoverable ring failure: supervisor restarts us
+      // Retryable: do NOT skip the rest of the iteration. EBUSY means the
+      // kernel could not flush CQ-overflow entries or accept more work until
+      // the application reaps; skipping the reap below would livelock. Timers
+      // and housekeeping must also keep running after EINTR. Unsubmitted SQEs
+      // stay queued and go out with the next submit.
+      ring_->flush_events(); // make overflowed CQEs visible to the reap below
     }
 
     const auto t0 = Clock::now();
@@ -147,9 +173,7 @@ void Worker::run() {
     inc(init_.metrics->cqes, n);
 
     timers_->advance(t0, [this](TimerNode &node) {
-      if (Connection *c = connections_->get(node.owner)) {
-        c->handle_timer(*ctx_, node.kind);
-      } else {
+      if (!connections_->on_timer(*ctx_, node.pool, node.owner, node.kind)) {
         inc(init_.metrics->stale_events); // would mean a leaked TimerNode
       }
     });
@@ -166,6 +190,8 @@ void Worker::run() {
 
     inc(init_.metrics->loop_iterations);
     set(init_.metrics->buffers_free, buffers_->free_count());
+    set(init_.metrics->relay_chunks_in_use, chunks_.in_use());
+    set(init_.metrics->relay_chunks_peak, chunks_.peak_in_use());
     set(init_.metrics->sq_full, ring_->sq_full_events());
     if (ring_->cq_overflowed()) {
       inc(init_.metrics->cq_overflow);
@@ -188,6 +214,8 @@ void Worker::dispatch(const Cqe &cqe) {
   case OpKind::Tick:
     on_tick();
     return;
+  case OpKind::Nop:
+    return; // placeholder SQE (see Ring::connect_with_timeout): no owner
   case OpKind::Cancel:
     if (cqe.tag.aux() == kAuxWorker) {
       on_listener_cancel(cqe);
@@ -207,12 +235,9 @@ void Worker::on_connection_cqe(const Cqe &cqe) {
     lease = buffers_->take(cqe.buffer_id(),
                            cqe.res > 0 ? static_cast<uint32_t>(cqe.res) : 0U);
   }
-  Connection *c = connections_->get(cqe.tag.handle());
-  if (c == nullptr) [[unlikely]] {
+  if (!connections_->on_cqe(*ctx_, cqe, lease)) [[unlikely]] {
     inc(init_.metrics->stale_events); // invariant I3/I4 violated: a bug
-    return;
   }
-  c->handle_cqe(*ctx_, cqe, lease);
 }
 
 void Worker::on_accept(const Cqe &cqe) {
@@ -233,21 +258,17 @@ void Worker::on_accept(const Cqe &cqe) {
       // fd closes via FdOwner: draining or listener already removed.
     } else {
       inc(init_.metrics->accepts);
-      switch (spec->protocol) {
-      case ProtocolKind::Echo: {
-        auto [h, conn] = connections_->create<EchoConnection>(std::move(fd));
-        if (conn == nullptr) {
-          inc(init_.metrics->conns_rejected); // pool full: shed load (I7)
-          break;
-        }
-        conn->bind(h);
-        set(init_.metrics->conns_live, connections_->live());
-        conn->start(*ctx_);
-        break;
+      const PoolId pool = pool_for(spec->protocol);
+      const auto p = pool_index(pool);
+      inc(init_.metrics->pool_accepts[p]);
+      // Static dispatch inside ConnPools: no virtual call, no per-type branch
+      // here. A full pool (or one sized 0) sheds load: the fd closes (I7).
+      ctx_->accepted = AcceptInfo{spec->id, spec->upstream_id};
+      if (!connections_->spawn(pool, *ctx_, fd)) {
+        inc(init_.metrics->conns_rejected);
+        inc(init_.metrics->pool_rejected[p]);
       }
-      default:
-        break; // not implemented yet: fd closes
-      }
+      publish_pool_gauges();
     }
   } else if (cqe.res != -ECANCELED) {
     inc(init_.metrics->accept_errors); // e.g. -EMFILE: back off, retry on tick
@@ -312,6 +333,8 @@ void Worker::apply(ApplyConfig &msg) {
   if (ok) {
     snapshot_ = msg.snapshot; // drops our ref to the old snapshot
     ctx_->limits = &snapshot_->limits;
+    upstreams_->apply_config(
+        *snapshot_); // copies: no pointer into the snapshot
     set(init_.metrics->config_generation, snapshot_->generation);
 
     for (auto &id : msg.remove) {
@@ -343,8 +366,7 @@ void Worker::begin_shutdown(const Shutdown &msg) {
   drain_deadline_ = ctx_->now + msg.drain_timeout;
   listeners_->for_each(
       [this](Handle h, ListenerSlot &s) { remove_listener(h, s); });
-  connections_->for_each(
-      [this](Handle, Connection &c) { c.begin_drain(*ctx_); });
+  connections_->begin_drain_all(*ctx_);
 }
 
 // ----------------------------------------------------------------- helpers
@@ -396,10 +418,19 @@ void Worker::reap_closed() {
   if (ctx_->closed.empty()) {
     return;
   }
-  for (Handle h : ctx_->closed) {
-    connections_->destroy(h);
+  for (const ConnRef c : ctx_->closed) {
+    connections_->destroy(c);
   }
   ctx_->closed.clear();
+  publish_pool_gauges();
+}
+
+void Worker::publish_pool_gauges() {
+  for (std::size_t p = 0; p < kPoolCount; ++p) {
+    set(init_.metrics->pool_live[p],
+        connections_->live(static_cast<PoolId>(p)));
+  }
+  set(init_.metrics->relay_chunks_in_use, chunks_.in_use());
   set(init_.metrics->conns_live, connections_->live());
 }
 
@@ -410,8 +441,7 @@ void Worker::check_shutdown_progress() {
   const auto now = ctx_->now;
   if (phase_ == Phase::Draining && now >= drain_deadline_) {
     phase_ = Phase::Stopping;
-    connections_->for_each(
-        [this](Handle, Connection &c) { c.close(*ctx_, Errc::Timeout); });
+    connections_->close_all(*ctx_, Errc::Timeout);
   }
   if (connections_->live() == 0 && listeners_->live() == 0) {
     done_ = true;

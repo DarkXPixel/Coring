@@ -13,6 +13,9 @@ struct RegionOptions {
   bool populate{
       true}; // pre-fault on the creating (worker) thread: first-touch NUMA
   bool hugepage{false}; // madvise(MADV_HUGEPAGE); best effort
+  // MAP_NORESERVE: do not charge the whole mapping against the overcommit
+  // budget up front. For large, lazily touched regions (relay chunk pool).
+  bool noreserve{false};
 };
 
 class Region {

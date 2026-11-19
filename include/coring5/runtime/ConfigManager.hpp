@@ -52,6 +52,7 @@ private:
   RuntimeConfig runtime_;
   bool have_runtime_{false};
   uint32_t next_listener_id_{1};
+  uint32_t next_upstream_id_{1};
   uint64_t next_generation_{1};
 };
 

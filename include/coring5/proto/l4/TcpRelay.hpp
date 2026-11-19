@@ -1,21 +1,23 @@
 #pragma once
 
-// L4 TCP relay (M3): client <-> upstream with bounded queues in both
-// directions (invariant I6). STATUS: interface only.
+// L4 TCP relay (M3). The implementation lives in:
+//   proto/l4/L4Conn.hpp       connection type: relay of two byte directions
+//   proto/l4/RelayQueue.hpp   bounded per-direction byte queue (chunk list)
+//   mem/ChunkPool.hpp         fixed-size chunk allocator behind the queues
+//   net/UpstreamDialer.hpp    protocol-neutral dial: pick, connect, retry,
+//   health upstream/UpstreamPool.hpp backend selection, passive health, panic
+//   mode
 //
-// Design notes:
-//  * Two Connection objects (client side, upstream side) cross-referencing each
-//    other ONLY through Handles; on a stale lookup the survivor treats the peer
-//    as closed (this is the legitimate use of `gen` for peer links).
-//  * Half-close: EOF on one side => flush the queue, shutdown(SHUT_WR) on the
-//    other; fully closed when both directions are done.
-//  * Backpressure: when a direction's queued bytes cross the high watermark,
-//    stop re-arming recv for its source; resume below the low watermark. A
-//    multishot recv that is already in flight may still deliver data after the
-//    decision to pause: it must be accepted, not dropped.
-//  * Strategies (selected by benchmark): copy through provided buffers, or
-//    splice(sock->pipe->sock) via a per-worker pipe pool for plaintext.
-
-namespace Coring5 {
-// TODO(M3): class RelayQueue, class TcpRelayClient, class TcpRelayUpstream.
-}
+// Design decisions (see docs/adr/0009-l4-relay-single-slot.md). They apply to
+// L4 only; HTTP/TLS/static upstream handling is a separate M4 ADR.
+//  * ONE pool slot owns both sockets (client = core.fd(), upstream =
+//    core.peer_fd()); ConnCore cancels the two fds separately. No peer handles.
+//  * Data is copied out of the shared provided-buffer ring into the relay queue
+//    at once (invariant I10), so a slow reader can never starve the ring.
+//  * A direction pauses its source at queue_high_watermark and resumes at
+//    queue_low_watermark (I6). Queue memory is bounded by the worker's chunk
+//    pool (runtime.relay_memory_mib).
+//  * Half-close: EOF on a source -> flush its queue -> IORING_OP_SHUTDOWN
+//    (SHUT_WR) on the sink; close when both directions are done.
+//  * Splice (sock -> pipe -> sock) is NOT implemented: the roadmap makes it
+//    benchmark-gated and no benchmark exists yet.

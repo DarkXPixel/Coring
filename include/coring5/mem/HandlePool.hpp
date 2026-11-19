@@ -4,8 +4,10 @@
 //
 //  * Capacity is fixed at construction: create() never allocates and returns
 //    {invalid, nullptr} when full (caller sheds load).
-//  * Slots hold polymorphic objects in-place: HandlePool<Connection, 256>
-//    can create<EchoConnection>() as long as it fits in 256 bytes.
+//  * Slots hold objects in-place. The slot size defaults to sizeof(T); a base
+//    type may be given a larger SlotBytes to host derived types.
+//  * Capacity 0 is valid: such a pool never allocates and create() always
+//    returns {invalid, nullptr} (a protocol with no listener has no slots).
 //  * `gen` is a plain 32-bit counter, 0 is reserved for "invalid". It is a
 //    tripwire, not the primary safety mechanism: for a connection's own
 //    in-flight operations, safety comes from "destroy only when inflight == 0".
@@ -28,7 +30,7 @@ template <class T, std::size_t SlotBytes = sizeof(T)> class HandlePool {
 public:
   explicit HandlePool(uint32_t capacity)
       : capacity_(capacity), slots_(std::make_unique<Slot[]>(capacity)) {
-    assert(capacity > 0 && capacity <= kMaxPoolCapacity);
+    assert(capacity <= kMaxPoolCapacity);
     // reserve(), NOT resize(): the legacy SessionStorage used resize() followed
     // by push_back() and ended up with `capacity` bogus zero entries at the
     // bottom of its free list (index 0 handed out twice).
