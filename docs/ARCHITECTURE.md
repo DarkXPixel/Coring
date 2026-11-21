@@ -1,3 +1,23 @@
+## Quick Reference (TL;DR)
+
+- Linux >= 6.1, thread-per-core share-nothing; one pinned `Worker` + one `Ring` (SINGLE_ISSUER) per core.
+- Layering: one lib `coring5_<module>` per module, deps downward only (`tools/check_layering.py` + CMake).
+- Modules: `base`, `mem` (`HandlePool`, `Region`, `ChunkPool`, `ChunkQueue`), `config`, `obs`, `http` (`BodyStream`), `io`, `net`, `proto/{http1,l4,http1conn,http2,http3}`, `upstream`, `control`, `runtime`.
+- Kernel-free modules (testable anywhere): `base`, `mem`, `config`, `http`, `proto/http1`, `upstream`.
+- Threads: control thread (signalfd, ConfigManager, ControlServer) + N workers; edges: `Mailbox`, `ReloadAck`, metric shards.
+- Worker: `init()` (pin, Ring, BufferRing, TimerWheel, pools, arm mailbox+tick) then `run()` loop: submit_and_wait, reap CQEs, timers, reap_closed, `publish()`, metrics.
+- Dispatch: switch on `OpTag::kind()`, then `OpTag::pool()` into static `ConnPool<T>`; no virtual calls.
+- `OpTag` = gen:32|index:20|kind:5|pool:4|aux:3; aux: `kAuxConnection`/`kAuxWorker`/`kAuxPeer`.
+- Conn lifecycle: Active -> Draining -> Closing -> Closed -> reaped. Types embed `ConnCore core`; concept `ConnectionType` (`start`, `on_cqe`, `on_timer`, `on_drain`).
+- Conn types: `EchoConn`, `L4Conn`, `Http1Conn`, `Http2Conn`, `Http3Conn`; pool capacities derived from config.
+- Memory: no data-path allocation; fixed pools; provided-buffer slab; `BufferRing::Lease` move-only; intrusive `TimerNode`.
+- Errors: `Result<T>=std::expected<T,Error{Errc,sys}>`; cold paths use `std::string`; `terminate` only on `io_uring_enter` failure in `Worker::run`.
+- Backpressure (I6): bounded queue per direction, `limits.queue_high/low_watermark`; ENOBUFS = retry/shed; half-close flush then `shutdown(SHUT_WR)`.
+- Protocols are sans-IO; HTTP/1 parser strict (rejects). H2=nghttp2 (M8), H3=ngtcp2+nghttp3 (M10), TLS=OpenSSL memory BIOs (M5).
+- Metrics: `WorkerMetrics` incl. `stale_events` (must be 0), `conns_rejected`, `sq_full`, `cq_overflow`, `loop_ns`.
+- Control socket: 0660, `SO_PEERCRED`.
+- Sections: 2 layering, 3 threads, 4 worker loop/OpTag/lifecycle, 5 memory, 6 errors, 7 data path, 8 protocols, 9 observability, 10 security.
+
 # Architecture
 
 ## 1. Goals and non-goals
@@ -36,6 +56,8 @@ flowchart TD
   io --> config
   io --> obs
   proto_http1 --> config
+  http --> mem
+  http --> config
   mem --> base
   config --> base
   obs --> base
@@ -47,13 +69,14 @@ flowchart TD
 | Module                                          | Responsibility                                                                      | Depends on kernel `io_uring`? |
 | ----------------------------------------------- | ----------------------------------------------------------------------------------- | ----------------------------- |
 | `base`                                          | `Result`/`Error`, `Handle`, `Endpoint`, `ReloadAck`, time types                     | no                            |
-| `mem`                                           | `HandlePool` (generation handles), `Region` (mmap slab)                             | no                            |
+| `mem`                                           | `HandlePool` (generation handles), `Region` (mmap slab), `ChunkPool` + `ChunkQueue` (relay/body queues) | no                |
 | `config`                                        | Snapshot types, TOML loader, validator, diff                                        | **no** (testable anywhere)    |
 | `obs`                                           | Per-worker metric shards, histograms, SPSC ring, access-log record                  | no                            |
+| `http`                                          | Sans-IO HTTP building blocks: `BodyStream` (bounded credit-based body queue). `Exchange`, `HeaderBlock`: M4.1+ | **no** (testable anywhere) |
 | `io`                                            | `Ring`, `BufferRing`, `OpTag`, `TimerWheel`, `ConnCore`, `ConnPool<T>`, `IoContext` | yes                           |
 | `net`                                           | Listening sockets (control thread); `UpstreamDialer` (worker: pick + connect + retry) | `UpstreamDialer` only         |
 | `proto/http1`                                   | Sans-IO request-head parser (body framing: M4)                                      | no                            |
-| `proto/l4`                                      | `EchoConn` (reference), `L4Conn` + `RelayQueue` (TCP relay, M3); UDP relay (M9)     | via `io`                      |
+| `proto/l4`                                      | `EchoConn` (reference), `L4Conn` (TCP relay, M3; queues are `mem/ChunkQueue`); UDP relay (M9)     | via `io`                      |
 | `proto/http1conn`, `proto/http2`, `proto/http3` | `Http1Conn` (answers 501/400), `Http2Conn`, `Http3Conn` operational stubs           | via `io`                      |
 | `upstream`                                      | `UpstreamPool`: backend pick, passive health, reload epochs (M3)                    | no                            |
 | `tls`, `handlers`                               | Design stubs for M4/M5                                                              | –                             |
@@ -120,15 +143,18 @@ INVARIANTS.md).
 ### Completion tag (`io/OpTag.hpp`)
 
 ```
-63            32 31          12 11      6 5     3 2     0
-+---------------+--------------+---------+-------+-------+
-|      gen      |    index     |  kind   | pool  |  aux  |   explicit shifts, not bit-fields
-+---------------+--------------+---------+-------+-------+   (bit-field layout is implementation-defined)
+63            32 31          12 11     7 6      3 2     0
++---------------+--------------+--------+--------+-------+
+|      gen      |    index     |  kind  |  pool  |  aux  |   explicit shifts, not bit-fields
++---------------+--------------+--------+--------+-------+   (bit-field layout is implementation-defined)
+   32 bits          20 bits      5 bits   4 bits   3 bits
 ```
 
-Capacity is therefore ≤ 2^20 slots per pool, with at most 8 pools (`PoolId`:
-echo, l4, http1, http2, http3). `aux` (0..7) distinguishes e.g. a connection's
-own cancel (`kAuxConnection`) from a listener removal cancel (`kAuxWorker`).
+Capacity is therefore ≤ 2^20 slots per pool, with at most 16 pools (`PoolId`:
+echo, l4, http1, http2, http3 today) and 32 operation kinds; both limits are
+`static_assert`ed against the enums in `io/OpTag.hpp`. `aux` (0..7)
+distinguishes e.g. a connection's own cancel (`kAuxConnection`) from a listener
+removal cancel (`kAuxWorker`) or a peer-fd cancel (`kAuxPeer`).
 
 ### Connection lifecycle (`io/Connection.hpp`)
 

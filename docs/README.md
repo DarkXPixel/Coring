@@ -10,6 +10,7 @@ its design; the code under `include/coring5` and `src/coring5` implements it.
 | [INVARIANTS.md](INVARIANTS.md)               | The rules (I1–I10) every change must respect, and how each is enforced |
 | [CONFIG_AND_RELOAD.md](CONFIG_AND_RELOAD.md) | Config schema, hot-reload protocol, ordering and failure behaviour     |
 | [ROADMAP.md](ROADMAP.md)                     | Tiers, milestones M0–M10, acceptance criteria, risks                   |
+| [EXCHANGE.md](EXCHANGE.md)                   | M4.1 design: Exchange state machine, BodyStream credit/backpressure, trailers (only `BodyStream` implemented) |
 | [TESTING.md](TESTING.md)                     | Unit / integration / fault-injection / fuzz strategy, how to run it    |
 | [BENCHMARKING.md](BENCHMARKING.md)           | Methodology, tools, scenarios, regression gating                       |
 | [OPERATIONS.md](OPERATIONS.md)               | Build, run, systemd, containers, kernel requirements, metrics          |
@@ -30,6 +31,7 @@ its design; the code under `include/coring5` and `src/coring5` implements it.
 | `proto/http1` head parser                                              | Implemented and fuzzed; body framing **not** implemented                                                                                           |
 | `proto/l4`, `proto/http1conn`, `proto/http2`, `proto/http3`            | `EchoConn` reference; `L4Conn`/`Http1Conn` operational stubs (listeners accepted); `Http2Conn`/`Http3Conn` stubs (pools exist, listeners rejected) |
 | `upstream`                                                             | Implemented (M3): `UpstreamPool` with RR/least-conn, passive ejection, panic mode, reload epochs                                                   |
+| `http`                                                                 | `BodyStream` implemented and unit-tested (credit/watermark/EOF/abort); `Exchange`, headers, trailers not yet                                      |
 | `tls`, `handlers`                                                      | Interface/design notes only                                                                                                                        |
 | HTTP/2, UDP, HTTP/3                                                    | Not started                                                                                                                                        |
 | `routing`                                                              | Still lives in `include/coring4/routing`; migrates in M4                                                                                           |

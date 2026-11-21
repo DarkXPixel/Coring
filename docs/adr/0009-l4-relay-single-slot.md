@@ -29,8 +29,9 @@ per-worker buffer ring and turn one slow client into `-ENOBUFS` for everyone.
   (RAII over `UpstreamPool::acquire/release`); what happens next is the
   caller's business. `L4Conn` keeps both as its peer and relays. Retrying is
   only safe because the caller has not consumed any client byte yet.
-* Received data is copied into a `RelayQueue` (linked chunks from a per-worker
-  `ChunkPool`) and the buffer lease is released immediately. A send reads
+* Received data is copied into a `ChunkQueue` (linked chunks from a per-worker
+  `ChunkPool`; named `RelayQueue` and living in `proto/l4` when this ADR was
+  written, moved to `mem/` in M4.1) and the buffer lease is released immediately. A send reads
   straight from the queue head; chunks are freed when the send completes, and
   the queue is cleared in the destructor (after `inflight == 0`).
 * Backpressure: pause the source above `limits.queue_high_watermark` (or when

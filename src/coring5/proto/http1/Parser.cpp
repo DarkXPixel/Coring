@@ -259,6 +259,9 @@ HeadResult parse_head(std::span<const char> in, const Limits &limits,
   if (out.chunked && out.has_content_length) {
     return fail(ParseError::ConflictingLength); // classic smuggling vector
   }
+  if (out.chunked && out.minor_version == 0) {
+    return fail(ParseError::BadTransferEncoding); // TE is HTTP/1.1 only
+  }
   if (out.minor_version == 1 && out.host.empty()) {
     return fail(ParseError::MissingHost); // RFC 9112 3.2: exactly one Host
   }

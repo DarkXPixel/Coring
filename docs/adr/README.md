@@ -15,4 +15,4 @@ new information. Format: context → decision → consequences. Status is
 | [0007](0007-layering-and-build.md)             | One library per module, downward-only links, checked includes                 |
 | [0008](0008-min-kernel-6-1.md)                 | Kernel floor 6.1; probe the rest                                              |
 | [0009](0009-l4-relay-single-slot.md) | L4 passthrough only: one slot owns both sockets; queues copy out of the buffer ring; dialing split into `net/UpstreamDialer`. HTTP/TLS/static upstream design deferred to M4 |
-| [0010](0010-m4-exchange-layer-sessions-tls-static.md) | **Proposed (draft).** M4 architecture: protocol-neutral Exchange layer (N+M adapters), session lifecycles per kind, sans-IO TLS `Transport`, static files as a response producer. Nothing implemented |
+| [0010](0010-m4-exchange-layer-sessions-tls-static.md) | **Proposed (draft).** M4 architecture: protocol-neutral Exchange layer (N+M adapters), session lifecycles per kind, sans-IO TLS `Transport`, static files as a response producer. Only the M4.0 `OpTag` bit split is implemented |

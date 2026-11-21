@@ -47,12 +47,14 @@ enum class ApplicationProtocol : uint8_t { L4, Http1, Http2, Quic };
 enum class ProtocolKind : uint8_t { Echo, L4, Http1, Http2, Http3 };
 
 // One connection pool per worker for each connection type. The id travels in
-// the io_uring user_data (3 bits, see io/OpTag.hpp), hence at most 8 pools.
+// the io_uring user_data (4 bits, see io/OpTag.hpp), hence at most 16 pools.
+// The authoritative check against the field width is the static_assert in
+// io/OpTag.hpp; this one only keeps the limit visible next to the enum.
 enum class PoolId : uint8_t { Echo, L4, Http1, Http2, Http3, Count_ };
 
 inline constexpr std::size_t kPoolCount =
     static_cast<std::size_t>(PoolId::Count_);
-static_assert(kPoolCount <= 8, "PoolId must fit in 3 bits of OpTag");
+static_assert(kPoolCount <= 16, "PoolId must fit in 4 bits of OpTag");
 
 [[nodiscard]] constexpr std::size_t pool_index(PoolId p) noexcept {
   return static_cast<std::size_t>(p);

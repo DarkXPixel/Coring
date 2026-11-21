@@ -26,6 +26,11 @@ coring5_add_test(coring5_unit_config SOURCES unit/config_test.cpp LIBS coring5_c
 coring5_add_test(coring5_unit_http1  SOURCES unit/http1_parser_test.cpp LIBS coring5_proto_http1)
 coring5_add_test(coring5_unit_obs    SOURCES unit/obs_test.cpp    LIBS coring5_obs)
 coring5_add_test(coring5_unit_relay  SOURCES unit/relay_test.cpp  LIBS coring5_proto_l4)
+coring5_add_test(coring5_unit_http    SOURCES unit/body_stream_test.cpp unit/exchange_test.cpp unit/exchange_random_test.cpp LIBS coring5_http)
+coring5_add_test(coring5_unit_body_framing SOURCES unit/body_framing_test.cpp LIBS coring5_http coring5_proto_http1)
+coring5_add_test(coring5_unit_chunked SOURCES unit/chunked_decoder_test.cpp LIBS coring5_http coring5_proto_http1)
+coring5_add_test(coring5_unit_smuggling SOURCES unit/smuggling_corpus_test.cpp LIBS coring5_http coring5_proto_http1)
+coring5_add_test(coring5_unit_response_writer SOURCES unit/response_writer_test.cpp LIBS coring5_proto_http1)
 
 # ---- integration tests (real io_uring + sockets) -----------------------------
 coring5_add_test(coring5_it_echo NEEDS_RING

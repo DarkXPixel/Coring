@@ -1,0 +1,67 @@
+# Coring agent rules (context economy first)
+
+## Reading policy
+- NEVER bulk-read `docs/` or `docs/adr/`. Do not read ADRs on routine tasks; the summary below is enough.
+- Read exactly ONE doc per subsystem (start with its "Quick Reference (TL;DR)" at the top, if present):
+  - Exchange / BodyStream / trailers / M4.1  -> `docs/EXCHANGE.md`
+  - Modules, layering, worker loop, OpTag, memory, protocols -> `docs/ARCHITECTURE.md`
+  - Rules I1..I10 (inflight, close, handles, deadlines) -> `docs/INVARIANTS.md`
+  - Config format, reload protocol, pools -> `docs/CONFIG_AND_RELOAD.md`
+  - Tests, FakeRing, fuzzing, CI -> `docs/TESTING.md`
+  - Build, run, metrics, troubleshooting -> `docs/OPERATIONS.md`
+  - Perf methodology -> `docs/BENCHMARKING.md`
+  - Milestones, status, gaps -> `docs/ROADMAP.md`
+- Files >300 lines: grep for headings/symbols first, then read line ranges only (`start_line`/`end_line`).
+- Do NOT modify or create `.md` files in `docs/` or `docs/adr/` unless the user explicitly asks.
+- Do not touch `build*/`, `.cache/`, `third_party/`, `compile_commands.json`, `.aider*`.
+
+## Terminal output
+- Always truncate build/test output: `cmake --build build 2>&1 | head -n 60`,
+  `ctest --test-dir build --output-on-failure 2>&1 | head -n 60`.
+- Never `cat` large files; use `grep -n` + line-range reads.
+
+## Architecture invariants (summary of ADR 0001-0010)
+- Platform: Linux >= 6.1 only (ADR 0008). `Ring::create` returns `Unsupported` below. DEFER_TASKRUN
+  optional (dropped on -EINVAL); optional features probed via `RingCaps`. No Windows/macOS.
+- Thread-per-core, share-nothing (ADR 0001): one pinned worker + one `io_uring` per core
+  (SINGLE_ISSUER). Worker is constructed and `init()`ed ON its own thread (I1). Cross-thread edges only:
+  Mailbox (control->worker), `ReloadAck`, single-writer metric shards. No locks on the data path.
+- Layering (ADR 0007): one static lib per module `coring5_<module>`; deps point DOWNWARD only;
+  checked by `tools/check_layering.py` + CMake. `config`, `http`, `proto/http1`, `mem`, `base` do not
+  depend on `io`/kernel (unit-testable anywhere).
+- Handles (ADR 0002, I4): `HandlePool` handles `{index, gen32}`, gen 0 invalid. `OpTag` user_data =
+  `gen:32|index:20|kind:5|pool:4|aux:3` (explicit shifts). Stale lookup -> `stale_events`, must stay 0
+  for own in-flight ops; stale peer links (Exchange sides, sessions) are normal, handle silently.
+- Inflight (ADR 0003, I2/I3): wrap EVERY submission in `core.counted(queued)`; count at queue time;
+  cancel SQEs, linked timeouts (2 CQEs), SEND_ZC (result + NOTIF) count; multishot drops only on CQE
+  without F_MORE; failed queue -> not counted, shed connection. Close: Closing -> counted cancel_fd
+  (SQ full -> shutdown(2)) -> wait inflight==0 -> close fd -> Closed -> Worker reaps after the CQE
+  batch (never inside own callback). No `on_cqe` in Closing. No polymorphic Connection base; types embed `ConnCore`.
+- Buffers (ADR 0006, I10): provided buffer ring, one mmap slab per worker; `Lease` is move-only RAII,
+  one recv->process->send step; never park a lease on an idle conn (copy partial head to bounded
+  staging). `publish()` once per loop iteration.
+- Config (ADR 0004, I5/I8): `ConfigSnapshot` immutable, shared as `shared_ptr<const>`. All fallible work
+  (parse, validate, bind, DNS, certs) on the control thread; worker apply only swaps pointer, arms
+  accepts, cancels removed listeners; drops snapshot ref BEFORE ack. `[runtime]` needs restart; `[limits]`
+  and `[[listener]]` reload. Connections store ids (`ListenerId`, `UpstreamId`), never snapshot pointers.
+- Sans-IO (ADR 0005): parsers/framers (HTTP/1, H2, H3, TLS adapter) take bytes, emit events; no sockets.
+  HTTP/1 parser is strict: rejects, never normalizes.
+- Data path (I6, I7, I9): no heap allocation, fixed-capacity pools, shed load (`conns_rejected`), never
+  `terminate()` except unrecoverable `io_uring_enter` in `Worker::run`. Bounded queues with high/low
+  watermarks. Every wait has a deadline (`DeadlineKind`, TimerWheel). Errors: `Result<T>=expected<T,Error>`.
+- L4 relay (ADR 0009): `L4Conn` owns BOTH fds (client + peer) in one slot; `UpstreamDialer` (net) does
+  pick/connect/retry within one budget, health via `UpstreamPool` (epochs, passive ejection, panic
+  mode). Received data copied into `mem/ChunkQueue` (ChunkPool) and lease released immediately.
+  L4 stays OUTSIDE the Exchange layer.
+- M4 Exchange layer (ADR 0010, PROPOSED; details in EXCHANGE.md): protocol-neutral `Exchange` = head
+  blocks + two bounded `BodyStream`s (ReqStream I->R, ResStream R->I) + trailers; N ingress + M egress
+  adapters. Lifecycle per kind (H1 egress idle cache; H2/H3 pooled sessions w/ stream handles). TLS =
+  sans-IO `TlsSession` + `transport` module. Static files = body producer (`FileReader`), not an upstream.
+  New modules `http` (no ring), `transport`. Implemented so far: `BodyStream`, OpTag split (M4.0).
+  Invariant: queued + claimed <= H; wake on consume/abort/finish; events are level hints via ready list.
+
+## Workflow
+- Surgical changes; follow existing style (`.clang-tidy`, `clang-format`). `-Werror` is on.
+- New connection type: follow checklist at the end of `docs/INVARIANTS.md` (read only that section).
+
+- If the task mentions `TODO.md`, read it first; after completing a step, tick its checkboxes (never touch `docs/`).

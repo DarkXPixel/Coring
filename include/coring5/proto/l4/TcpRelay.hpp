@@ -2,11 +2,10 @@
 
 // L4 TCP relay (M3). The implementation lives in:
 //   proto/l4/L4Conn.hpp       connection type: relay of two byte directions
-//   proto/l4/RelayQueue.hpp   bounded per-direction byte queue (chunk list)
+//   mem/ChunkQueue.hpp        bounded per-direction byte queue (chunk list)
 //   mem/ChunkPool.hpp         fixed-size chunk allocator behind the queues
-//   net/UpstreamDialer.hpp    protocol-neutral dial: pick, connect, retry,
-//   health upstream/UpstreamPool.hpp backend selection, passive health, panic
-//   mode
+//   net/UpstreamDialer.hpp    protocol-neutral dial: pick, connect, retry
+//   upstream/UpstreamPool.hpp backend selection, passive health, panic mode
 //
 // Design decisions (see docs/adr/0009-l4-relay-single-slot.md). They apply to
 // L4 only; HTTP/TLS/static upstream handling is a separate M4 ADR.

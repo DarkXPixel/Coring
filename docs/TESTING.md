@@ -30,6 +30,7 @@ suite under both before merging anything touching `io/` or `runtime/`.
 | `base_test.cpp`         | `Endpoint::parse` accept/reject tables, `Errc` names, `Error` is 8 bytes, `ReloadAck` across threads and timeout                                                                                                                                                                                      |
 | `config_test.cpp`       | Parse + validate, empty doc, syntax/type errors, semantic matrix, missing file, `diff_snapshots`                                                                                                                                                                                                      |
 | `http1_parser_test.cpp` | Happy paths, NeedMore at every prefix, pipelined bytes, keep-alive rules, **25 smuggling/malformed cases each pinned to a specific `ParseError`**, limits, segmentation independence                                                                                                                  |
+| `body_stream_test.cpp`  | `BodyStream`: credit invariant `queued+claimed<=H`, claim clamp, wake rule (low watermark AND credit), no wake on claim release, EOF/trailer ordering, abort wakes both sides and drops credit, declared length, pool exhaustion, borrow semantics, 300-seed randomized run against a reference model; mutation-checked (section 4.2) |
 | `obs_test.cpp`          | Histogram quantiles/clamping, metric aggregation, SPSC drop-on-full and 200k-item two-thread ordering                                                                                                                                                                                                 |
 
 `tests/coring5/integration` (uses `support/TestServer.hpp`: in-process
@@ -119,6 +120,40 @@ decides which CQEs to deliver and in what order:
 6. no fd left open (fake fd table)
 
 Reduce failures to a seed + a printed CQE trace.
+
+### 4.1 Design model for the Exchange layer
+
+`tools/exchange_model.py` (Python, standard library, about 20 s, **not in CI**)
+exhaustively explores an abstract Exchange with two bounded BodyStreams and
+checks safety, cleanup, lost-wakeup and reachability properties, including
+mutation runs that must fail. It exists to validate the credit/wake rules of
+[EXCHANGE.md](EXCHANGE.md) before they are written in C++; the planned C++
+randomized lifecycle test for the `http` module (EXCHANGE.md §8) should reuse
+its action alphabet so a failing seed can be replayed in the model.
+
+### 4.2 Mutation check of `BodyStream` (manual, not in CI)
+
+Each rule of EXCHANGE.md 3.4 was removed from `BodyStream.cpp` one at a time
+and the suite re-run; every mutation except the deliberately redundant one is
+caught, by the named tests:
+
+| Mutation | Caught by |
+|---|---|
+| no wake on consume | `BodyStreamWake.*` (4), `BodyStreamAbort.WakesBothAtOnce...`, `BodyStreamRandom` |
+| wake ignores the low watermark | `BodyStreamWake.ConsumeWakes...`, `BodyStreamRandom` |
+| wake ignores available credit | `BodyStreamWake.LargeWantResumesLater...`, `BodyStreamRandom` |
+| claim not clamped to H | `BodyStreamCredit.ClaimIsClamped...`, `BodyStreamRandom` |
+| abort keeps the claim | `BodyStreamAbort.DropsQueueAndCredit...`, `...Declared.PushingMore...`, `...Pool.Exhaustion...`, `BodyStreamRandom` |
+| abort does not wake the producer | `BodyStreamAbort.WakesABlockedProducer`, `...WakesBoth...`, `BodyStreamRandom` |
+| abort does not wake the consumer | `BodyStreamAbort.WakesAWaitingConsumer` |
+| finish keeps the claim | `BodyStreamEof.FinishReturnsAnOutstandingClaim` |
+| push does not settle the claim | 17 tests |
+| waking the producer on claim release | **not caught, by design** (rule 6: redundant; the test `ShortPushReturns...WithoutWakingAnyone` only checks the no-wake outcome in a state where the wake rule would not fire anyway) |
+
+The last row is an honest gap: no test can distinguish "does not wake on
+release" from "wakes on release" because a blocked producer holds no claim, so
+the extra call is unobservable. It is harmless, which is why the spec forbids
+it only as a style rule, not as a safety rule.
 
 ## 5. Fuzzing
 

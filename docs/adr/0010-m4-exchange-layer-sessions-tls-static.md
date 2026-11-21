@@ -1,8 +1,13 @@
 # ADR 0010 — M4 architecture: protocol-neutral Exchange layer, session lifecycles, sans-IO TLS transport, static files
 
-**Status: PROPOSED (draft).** Nothing in this ADR is implemented. It decides
+**Status: PROPOSED (draft).** The only part implemented so far is the M4.0
+`OpTag` bit split (§4.4); everything else is unimplemented. It decides
 *shapes and boundaries* so M4 can start; every item in "Deferred" is
-deliberately left open. It builds on ADR 0003 (in-flight accounting), 0005
+deliberately left open, including the H1 idle-liveness strategy (§4.1, M4.3).
+The M4.1 detail of §3 (the `Exchange` state machine, `BodyStream` credit and
+wake rules, trailer validation) is specified in
+[EXCHANGE.md](../EXCHANGE.md), which this ADR defers to wherever they differ;
+that spec is also design only. It builds on ADR 0003 (in-flight accounting), 0005
 (sans-IO), 0006 (buffers/leases) and 0009 (L4 only), and does not change
 them. Supersede this ADR rather than editing it once implementation starts.
 
@@ -132,15 +137,21 @@ bytes(), declared_length?        a mismatch with declared length => abort(Protoc
 events: Readable (consumer), Writable (producer; fires once bytes <= low watermark)
 ```
 
-The queue is the existing chunk-list design (`RelayQueue` over `ChunkPool`);
-the byte queue moves down to `mem/` when the second user appears (it only
-needs `ChunkPool`). L4 keeps using it directly.
+The queue is the chunk-list design of M3, now `mem/ChunkQueue` over
+`mem/ChunkPool` (moved down from `proto/l4` when `BodyStream` became its second
+user, because `http` may not depend on `proto/l4`). L4 keeps using it directly.
 
-Bound: byte-stream protocols (H1) may exceed the high watermark by at most one
-receive (data already requested). **Window protocols (H2/H3) never exceed it**:
-credit is granted only for `high - bytes - outstanding_credit`, and returned
-when the consumer drains. So a slow reader bounds memory by construction for
-every protocol, which is the M3 acceptance property carried to M4.
+Bound: **no protocol exceeds the high watermark**. A producer must `claim`
+credit (`high - queued - claimed`) *before* it asks the transport for bytes: H1
+claims `Q` before arming the single-shot recv, H2/H3 grant window only against
+available credit, and credit is returned when the consumer drains. So a slow
+reader bounds memory by construction for every protocol, which is the M3
+acceptance property carried to M4. (An earlier draft of this section let H1
+exceed the watermark by one receive; the exhaustive model in EXCHANGE.md §7
+shows the claim-first rule is both safe and live, so the exception is dropped.
+L4 keeps its own queue and its own "high watermark + one recv" bound.) The
+precise claim/push/consume/finish/abort contract and its wake rules are in
+[EXCHANGE.md](../EXCHANGE.md) §3.
 
 **Borrow rule.** A byte-stream session (H1, as in L4) may `send` straight from
 `front()` and call `consume()` only after the send CQE. A multiplexed session
@@ -205,13 +216,27 @@ a `Transport` on its client side. That needs no Exchange.
   `(UpstreamId, backend, epoch)`, capped per backend, with the keep-alive
   deadline from `limits.keepalive_timeout` (I9). A reload that changes the
   upstream bumps its epoch, so stale idle entries are dropped on next touch.
-* **Liveness without a probe [assumed].** An idle connection keeps *one armed
-  `recv`* (it costs no buffer until data arrives, I10). If it completes while
-  idle (EOF, error, or stray bytes) the connection is closed and evicted. On
-  checkout the armed `recv` simply becomes the response read. This replaces
-  the roadmap's "MSG_PEEK liveness probe", which has no cheap async form on
-  io_uring, and removes the cancel-and-rearm race. It must be proven with the
-  deterministic ring harness (`FakeRing`, TESTING §4), which is still unbuilt.
+* **Idle-connection liveness: DECISION DEFERRED TO M4.3.** The roadmap names a
+  `MSG_PEEK` probe at reuse time. That has no cheap async form on io_uring and
+  a synchronous peek on the loop thread is a race of its own, so the choice is
+  genuinely open. Candidates, none of them selected here:
+  1. *Armed idle `recv`:* park the connection with one outstanding `recv` (no
+     provided buffer is consumed until data arrives, so I10 holds). If it
+     completes while idle (EOF, error, stray bytes) evict; at checkout it
+     simply becomes the response read. Avoids a cancel-and-rearm step but makes
+     checkout depend on an operation that may be mid-completion.
+  2. *Cancel-and-rearm / probe at checkout:* park with nothing in flight and
+     verify on reuse (non-blocking `recv(MSG_PEEK)` or a short-lived op).
+     Simpler ownership, but pays a check on every reuse.
+  3. *No liveness check:* reuse blindly and rely on the retry rule below.
+     Cheapest, and may be good enough when retries are safe.
+
+  The deciding evidence is a deterministic test of the race (a peer closing an
+  idle connection while it is being checked out), which needs the `FakeRing`
+  harness (TESTING §4, not yet written). M4.3 therefore starts by building that
+  harness, then picks one candidate with a test that fails for the other
+  designs' failure modes. Nothing in M4.0–M4.2 may depend on the choice: until
+  then H1 egress is connection-per-request (no idle pool at all).
 * `BackendLease` is released when parked and re-acquired at checkout, so
   least-connections counts *active* use, not idle sockets.
 * The classic race (server closes an idle connection as we send): the request
@@ -256,22 +281,26 @@ timers; a finer timer path is needed in M10 and is **not** decided here. Check
 in M10 that `ConnCore::close()` is fine for a connection with no fd (it
 currently cancels `fd()` unconditionally when ops are in flight). **[assumed]**
 
-### 4.4 Pool-id budget (decision needed before the second egress type)
+### 4.4 Pool-id budget (DONE in M4.0)
 
-`OpTag` has 3 pool bits (8 ids) **[checked]**; 5 are used (Echo, L4, Http1,
-Http2, Http3). This design needs at least Http1Up, Http2Up, Http3Up and
-FileReader: nine. Options:
+`OpTag` had 3 pool bits (8 ids) with 5 used (Echo, L4, Http1, Http2, Http3).
+This design needs at least Http1Up, Http2Up, Http3Up and FileReader: nine.
+Options were:
 
-1. **Take one bit from `kind`** (`OpKind` uses 14 of 64 values **[checked]**;
-   5 bits allow 32, enough even with Openat/Statx/Close added): `pool` becomes
-   4 bits (16 ids). The layout uses explicit shifts, so this is mechanical.
-   `optag_test` must be updated anyway: it asserts a 6-bit `aux` that the
-   current 3-bit layout already does not have.
+1. **Take one bit from `kind`** (`OpKind` used 15 of 64 values; 5 bits allow
+   32, enough even with Openat/Statx/Close added): `pool` becomes 4 bits
+   (16 ids). The layout uses explicit shifts, so this is mechanical.
 2. Share one pool per protocol for both roles (role-parameterized slot type).
    Fits in 8, but one slot size must cover both roles, which defeats "a slot is
    exactly `sizeof(T)`" (ARCHITECTURE §5).
 
-**Proposed: option 1**, as the first M4 change, with its own small commit.
+**Chosen and implemented: option 1.** The layout is now
+`gen:32 | index:20 | kind:5 | pool:4 | aux:3`. The field widths are named
+constants in `io/OpTag.hpp`, and `static_assert`s tie them to `OpKind::Count_`,
+`kPoolCount` and `kMaxHandleIndex`, so exceeding a field fails the build
+instead of corrupting tags. This reserves the id space only: no new `PoolId`
+value was added (no pool type exists for them yet), and the wire values of the
+existing kinds and pools are unchanged except for their bit positions.
 
 ### 4.5 Refinement of ADR 0009's open consequence
 
@@ -449,9 +478,9 @@ Rules this implies:
 
 **Falsifier (how we will know this ADR is wrong):** the first H2 ingress
 implementation (M8) must not require changes to the Exchange/BodyStream API or
-to H1 code. If it does, or if the H1 egress idle `recv` trick (4.1) cannot be
-made race-free under `FakeRing`, supersede this ADR instead of patching around
-it.
+to H1 code. If it does, or if none of the idle-liveness candidates (4.1) can be
+made race-free under `FakeRing` in M4.3, supersede this ADR instead of patching
+around it.
 
 ## 10. Deferred decisions and non-goals
 
@@ -459,10 +488,12 @@ Not decided here, to be settled in the milestone shown:
 
 | Topic | When |
 |---|---|
-| Exact `Exchange` state machine, trailer rules (`Trailer`/`TE` negotiation, trailers on CL-framed H1 responses), early response while request body streams, `100-continue`/1xx forwarding policy | M4.1 |
+| Exact `Exchange` state machine, `BodyStream` credit rules, trailer rules, early response, 1xx forwarding | **specified in [EXCHANGE.md](../EXCHANGE.md) (design only); implementation M4.1** |
+| Open items of EXCHANGE.md §9 (pool-aware claims, forcing chunked for announced trailers, request-trailer opt-in, `100-continue` details, window-update coalescing) | M4.1–M4.2, M8 |
 | Pipelining policy for H1 ingress (initially: none) | M4.1 |
 | `Exchange` pool sizing/config key and head storage layout (chunk chain vs arena) | M4.1 |
-| `PoolId`/`OpKind` bit split (4.4) | first M4 commit |
+| ~~`PoolId`/`OpKind` bit split (4.4)~~ | **done in M4.0** |
+| H1 egress idle-connection liveness strategy (4.1) | **M4.3**, after `FakeRing` exists |
 | `ChunkPool` partitioning between L4 and HTTP; renaming `relay_memory_mib` | M4.2 |
 | Idle-cache sizing (`max_idle_keepalive`), eviction order, per-backend caps | M4.3 |
 | Static: metadata cache and invalidation, MIME table, symlink policy, root dirfd delivery, `SPLICE` strategy | M4.4 |
@@ -479,13 +510,16 @@ buffering to disk; kTLS and TLS-in-front-of-L4.
 
 ## 11. Proposed M4 sequence (each step demoable, 0 layering violations, `-Werror`)
 
-1. **M4.0** `PoolId`/`OpKind` bit split; `http` module with `HeaderBlock`,
-   `BodyStream`, `Exchange` state machine and unit tests (no ring).
+1. **M4.0** `PoolId`/`OpKind` bit split (**done**: `OpTag` is now
+   `gen:32 | index:20 | kind:5 | pool:4 | aux:3`); then the `http` module with
+   `HeaderBlock`, `BodyStream`, `Exchange` state machine and unit tests (no
+   ring) — not started.
 2. **M4.1** H1 ingress + body framing + `Respond`/`Redirect` handlers (no
    upstream).
 3. **M4.2** H1 egress with connection-per-request via `UpstreamDialer` +
    `ReverseProxy`; first end-to-end bodies with backpressure tests.
-4. **M4.3** H1 keep-alive idle cache (needs `FakeRing`, TESTING §4).
+4. **M4.3** `FakeRing` harness, then the H1 keep-alive idle cache; the idle
+   liveness strategy (4.1) is chosen here, driven by a deterministic race test.
 5. **M4.4** `StaticFile` + `FileReader` + path-escape corpus.
 6. **M4.5** Upgrade/WebSocket tunnel mode.
 

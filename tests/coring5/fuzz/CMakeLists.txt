@@ -18,5 +18,6 @@ function(coring5_fuzz name source lib)
 endfunction()
 
 coring5_fuzz(fuzz_http1_head  http1_head.cpp  coring5_proto_http1)
+coring5_fuzz(fuzz_http1_body  http1_body.cpp  coring5_proto_http1)
 coring5_fuzz(fuzz_config      config.cpp       coring5_config)
 coring5_fuzz(fuzz_endpoint    endpoint.cpp     coring5_base)

@@ -18,6 +18,8 @@ ALLOWED = {
     "mem": {"base"},
     "config": {"base"},
     "obs": {"base"},
+    # sans-IO: no io, no net. (obs joins when stream counters land.)
+    "http": {"base", "mem", "config"},
     "io": {"base", "mem", "config", "obs"},
     "net": {"base", "io", "upstream"},
     "proto/http1": {"base", "config"},

@@ -1,3 +1,21 @@
+## Quick Reference (TL;DR)
+
+- I1: `Ring` lives/used only on its worker thread; `Worker` built and `init()`ed on that thread.
+- I2: count EVERY CQE-producing submission at queue time via `counted(queued)`; cancel SQEs, linked timeouts (2), SEND_ZC (result+NOTIF) count; multishot drops on CQE without `F_MORE`; unqueued -> not counted -> shed.
+- I3: close = Closing -> counted `cancel_fd` (SQ full: `shutdown(2)`) -> wait `inflight==0` -> close fd -> Closed -> Worker reaps after CQE batch; no `on_cqe` in Closing.
+- I4: `HandlePool` `{index, gen32}`, gen 0 invalid; `OpTag` gen:32|index:20|kind:5|pool:4|aux:3; `stale_events` must be 0 for own ops; stale peer links are normal.
+- I5: worker config apply is infallible; all fallible work on control thread.
+- I6: every byte stream has a bounded queue with high/low watermarks.
+- I7: no data-path heap allocation; shed load (`conns_rejected`); never `terminate()` except `io_uring_enter` in `Worker::run`.
+- I8: connections store ids (`ListenerId`, `UpstreamId`), never snapshot pointers; worker drops snapshot ref before `ack`.
+- I9: every wait has a deadline (`DeadlineKind`, `TimerWheel`).
+- I10: never park a provided-buffer `Lease` across idle; copy partial head to bounded staging.
+- Key types: `ConnCore`, `ConnPool<T>`, `HandlePool`, `OpTag`, `BufferRing::Lease`, `TimerWheel`, `ReloadAck`, `ConfigSnapshot`.
+- Lifecycle FSM: Active -> Draining -> Closing -> Closed.
+- Retryable `io_uring_enter` errors (EINTR/EBUSY/EAGAIN) never skip the rest of the loop iteration.
+- New connection type checklist: at the end of this file ("Review checklist").
+- Sections: I1..I10 detail, then checklist.
+
 # Invariants
 
 These ten rules are the contract every module relies on. Most `io_uring` proxy
@@ -9,7 +27,7 @@ is enforced in code, and how it is tested.
 | I1  | A `Ring` lives and is used only on its worker thread                                                  | `Worker::init()` runs on the worker thread; `WorkerGroup` constructs `Worker` there; `SINGLE_ISSUER` makes the kernel reject violations |
 | I2  | Every SQE is counted in-flight at prep time; only a CQE without `F_MORE` decrements                   | `ConnCore::counted()`, `Ring::prep` returns `bool`; `assert` in `ConnCore::begin_cqe`                                                   |
 | I3  | fd closed / slot freed only when `Closing && inflight == 0`                                           | `ConnCore::finish()`, `Worker::reap_closed()`                                                                                           |
-| I4  | `user_data = gen:32 \| index:20 \| kind:6 \| aux:6`, checked on every lookup; `stale_events == 0`     | `OpTag`, `HandlePool::get`, `WorkerMetrics::stale_events` asserted in tests                                                             |
+| I4  | `user_data = gen:32 \| index:20 \| kind:5 \| pool:4 \| aux:3`, checked on every lookup; `stale_events == 0` | `OpTag`, `HandlePool::get`, `WorkerMetrics::stale_events` asserted in tests                                                             |
 | I5  | Applying config on a worker is infallible                                                             | `ConfigManager` does all fallible work first; `Worker::apply` only swaps and arms                                                       |
 | I6  | Every byte stream has a bounded queue with watermarks                                                 | `limits.queue_*_watermark`; relay design in ARCHITECTURE §7 (M3)                                                                        |
 | I7  | No heap allocation on the data path; shed load, never `terminate()`                                   | Fixed-capacity pools, `conns_rejected`, SQ-full handling                                                                                |

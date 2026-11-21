@@ -72,12 +72,12 @@ BENCHMARKING.md).
 
 Non-blocking connect with `LINK_TIMEOUT`; `UpstreamPool` (numeric endpoints from
 the snapshot; round-robin, then least-connections; passive health ejection);
-`RelayQueue` with watermarks and half-close; idle timeouts; optional splice
+`ChunkQueue` (was `RelayQueue`) with watermarks and half-close; idle timeouts; optional splice
 strategy. Config: `protocol = "l4"`, `upstream = "<name>"`.
 Acceptance: slow-reader test keeps RSS bounded; 1M-connection churn leaks no fds
 or slots; iperf3 through the proxy is limited by the NIC/loopback.
 
-**Status:** implemented (`L4Conn`, `RelayQueue`, `ChunkPool`, `UpstreamPool`,
+**Status:** implemented (`L4Conn`, `ChunkQueue`, `ChunkPool`, `UpstreamPool`,
 `net/UpstreamDialer`, `[[upstream]]` config; ADR 0009, which is scoped to L4
 only). Covered by `tests/coring5/integration/l4_test.cpp`
 (relay integrity, 8 MiB with tiny watermarks, half-close, upstream close,
@@ -91,6 +91,9 @@ runs (no benchmark has been run, see BENCHMARKING.md).
 (protocol-neutral Exchange layer, upstream session lifecycles, sans-IO TLS
 `Transport`, static files as a response producer). It proposes the step order
 M4.0–M4.5 and what is deliberately left open. ADR 0009 does not cover these.
+The M4.1 detail (Exchange state machine, BodyStream credit rules, trailers) is
+specified, design only, in [EXCHANGE.md](EXCHANGE.md); its protocol is checked
+by the exhaustive model `tools/exchange_model.py`.
 
 Body framing (Content-Length, chunked decoder as a state machine, trailers),
 response serializer, server session (pipelining policy, keep-alive,

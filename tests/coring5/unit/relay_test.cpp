@@ -1,5 +1,5 @@
 #include "coring5/mem/ChunkPool.hpp"
-#include "coring5/proto/l4/RelayQueue.hpp"
+#include "coring5/mem/ChunkQueue.hpp"
 #include "coring5/upstream/UpstreamPool.hpp"
 #include <cstring>
 #include <gtest/gtest.h>
@@ -18,7 +18,7 @@ std::vector<std::byte> bytes_of(const std::string &s) {
 }
 
 // Drains `q` completely through front()/consume() in `step`-sized bites.
-std::string drain(RelayQueue &q, ChunkPool &p, uint32_t step) {
+std::string drain(ChunkQueue &q, ChunkPool &p, uint32_t step) {
   std::string out;
   while (!q.empty()) {
     const auto f = q.front(p);
@@ -66,21 +66,21 @@ TEST(ChunkPool, EmptyPoolNeverAllocates) {
   EXPECT_EQ(p.capacity(), 0U);
 }
 
-// ----------------------------------------------------------------- RelayQueue
+// ----------------------------------------------------------------- ChunkQueue
 
-TEST(RelayQueue, PushOnZeroCapacityPoolIsRefusedWithoutCrashing) {
+TEST(ChunkQueue, PushOnZeroCapacityPoolIsRefusedWithoutCrashing) {
   ChunkPool p; // chunk_size 0: would divide by zero without the guard
-  RelayQueue q;
+  ChunkQueue q;
   const auto d = bytes_of("x");
   EXPECT_FALSE(q.push(p, d));
   EXPECT_TRUE(q.empty());
 }
 
-TEST(RelayQueue, PreservesOrderAcrossChunkBoundaries) {
+TEST(ChunkQueue, PreservesOrderAcrossChunkBoundaries) {
   auto r = ChunkPool::create(16, 64);
   ASSERT_TRUE(r);
   ChunkPool &p = *r;
-  RelayQueue q;
+  ChunkQueue q;
   std::string want;
   for (int i = 0; i < 40; ++i) {
     std::string piece(static_cast<std::size_t>(i % 7 + 1),
@@ -93,11 +93,11 @@ TEST(RelayQueue, PreservesOrderAcrossChunkBoundaries) {
   EXPECT_EQ(p.free_count(), p.capacity()) << "chunks leaked";
 }
 
-TEST(RelayQueue, PushIsAllOrNothingWhenThePoolIsShort) {
+TEST(ChunkQueue, PushIsAllOrNothingWhenThePoolIsShort) {
   auto r = ChunkPool::create(16, 2);
   ASSERT_TRUE(r);
   ChunkPool &p = *r;
-  RelayQueue q;
+  ChunkQueue q;
   ASSERT_TRUE(q.push(p, bytes_of(std::string(20, 'a')))); // 2 chunks
   const auto before = q.bytes();
   EXPECT_FALSE(q.push(p, bytes_of(std::string(13, 'b')))); // needs a 3rd
@@ -107,27 +107,27 @@ TEST(RelayQueue, PushIsAllOrNothingWhenThePoolIsShort) {
   EXPECT_EQ(p.free_count(), 2U);
 }
 
-TEST(RelayQueue, FrontStaysValidWhilePushingBehindIt) {
+TEST(ChunkQueue, FrontStaysValidWhilePushingBehindIt) {
   // An in-flight send reads straight from front(): appending must not move it.
   auto r = ChunkPool::create(16, 8);
   ASSERT_TRUE(r);
   ChunkPool &p = *r;
-  RelayQueue q;
+  ChunkQueue q;
   ASSERT_TRUE(q.push(p, bytes_of("0123456789")));
   const auto f = q.front(p);
   const std::byte *addr = f.data();
   ASSERT_TRUE(q.push(p, bytes_of(std::string(40, 'z'))));
   EXPECT_EQ(q.front(p).data(), addr);
   EXPECT_EQ(std::memcmp(addr, "0123456789", 10), 0);
-  q.clear(p); // a RelayQueue must be empty when destroyed
+  q.clear(p); // a ChunkQueue must be empty when destroyed
   EXPECT_EQ(p.free_count(), p.capacity());
 }
 
-TEST(RelayQueue, ClearReturnsEverything) {
+TEST(ChunkQueue, ClearReturnsEverything) {
   auto r = ChunkPool::create(16, 8);
   ASSERT_TRUE(r);
   ChunkPool &p = *r;
-  RelayQueue q;
+  ChunkQueue q;
   ASSERT_TRUE(q.push(p, bytes_of(std::string(100, 'q'))));
   q.consume(p, 30);
   q.clear(p);
@@ -135,11 +135,11 @@ TEST(RelayQueue, ClearReturnsEverything) {
   EXPECT_EQ(p.free_count(), 8U);
 }
 
-TEST(RelayQueue, RandomizedAgainstReferenceModel) {
+TEST(ChunkQueue, RandomizedAgainstReferenceModel) {
   auto r = ChunkPool::create(32, 128);
   ASSERT_TRUE(r);
   ChunkPool &p = *r;
-  RelayQueue q;
+  ChunkQueue q;
   std::string model;
   std::mt19937 rng(12345);
   for (int step = 0; step < 20000; ++step) {

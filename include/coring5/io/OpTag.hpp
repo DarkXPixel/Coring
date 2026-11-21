@@ -2,17 +2,22 @@
 
 // 64-bit io_uring user_data layout (invariant I4):
 //
-//   63            32 31          12 11      6 5     3 2     0
-//   +---------------+--------------+---------+-------+-------+
-//   |      gen      |    index     |  kind   | pool  |  aux  |
-//   +---------------+--------------+---------+-------+-------+
-//        32 bits        20 bits       6 bits   3 bits  3 bits
+//   63            32 31          12 11     7 6      3 2     0
+//   +---------------+--------------+--------+--------+-------+
+//   |      gen      |    index     |  kind  |  pool  |  aux  |
+//   +---------------+--------------+--------+--------+-------+
+//        32 bits        20 bits      5 bits   4 bits   3 bits
 //
 // Explicit shifts, not bit-fields: bit-field layout is implementation-defined.
 //
 // pool/index/gen address a slot in one of the worker's connection pools (or a
 // listener slot, where pool is 0 and unused); kind says what the completed
 // operation was.
+//
+// Budget: up to 16 pools and 32 operation kinds. (M4.0 moved one bit from
+// `kind`, which had 6, to `pool`, which had 3; see docs/adr/0010.) The widths
+// below are the single source of truth; the static_asserts tie them to the
+// enums so that adding a pool or kind past the limit fails the build.
 
 #include "coring5/base/Types.hpp"
 #include <cassert>
@@ -35,10 +40,35 @@ enum class OpKind : uint8_t {
   Splice,
   RecvMsg,
   Shutdown, // IORING_OP_SHUTDOWN (half-close of a relayed stream)
-  Count_    // must stay <= 64
+  Count_    // must stay <= 1 << kOpKindBits (see below)
 };
 
-static_assert(static_cast<unsigned>(OpKind::Count_) <= 64);
+// Field geometry. Fields are packed from the least significant bit upwards.
+inline constexpr unsigned kOpAuxBits = 3;
+inline constexpr unsigned kOpPoolBits = 4;
+inline constexpr unsigned kOpKindBits = 5;
+inline constexpr unsigned kOpIndexBits = 20;
+inline constexpr unsigned kOpGenBits = 32;
+
+inline constexpr unsigned kOpPoolShift = kOpAuxBits;
+inline constexpr unsigned kOpKindShift = kOpPoolShift + kOpPoolBits;
+inline constexpr unsigned kOpIndexShift = kOpKindShift + kOpKindBits;
+inline constexpr unsigned kOpGenShift = kOpIndexShift + kOpIndexBits;
+
+static_assert(kOpGenShift == 32 && kOpGenShift + kOpGenBits == 64,
+              "OpTag fields must tile all 64 bits exactly");
+static_assert(kOpIndexBits == 20 &&
+                  (kMaxHandleIndex + 1U) == (1U << kOpIndexBits),
+              "kMaxHandleIndex must match the index field width");
+static_assert(static_cast<unsigned>(OpKind::Count_) <= (1U << kOpKindBits),
+              "too many OpKinds for the kind field");
+static_assert(kPoolCount <= (1U << kOpPoolBits),
+              "too many pools for the pool field");
+
+inline constexpr uint64_t kOpAuxMask = (uint64_t{1} << kOpAuxBits) - 1;
+inline constexpr uint64_t kOpPoolMask = (uint64_t{1} << kOpPoolBits) - 1;
+inline constexpr uint64_t kOpKindMask = (uint64_t{1} << kOpKindBits) - 1;
+inline constexpr uint64_t kOpIndexMask = (uint64_t{1} << kOpIndexBits) - 1;
 
 // `aux` meaning for OpKind::Cancel: who issued it (3 bits: 0..7).
 inline constexpr uint8_t kAuxConnection = 0;
@@ -58,13 +88,14 @@ struct OpTag {
                               PoolId pool = PoolId::Echo) noexcept {
     assert(index <= kMaxHandleIndex);
     assert(aux <= kAuxMax);
-    assert(static_cast<unsigned>(pool) < 8U);
+    assert(static_cast<uint64_t>(pool) <= kOpPoolMask);
+    assert(static_cast<uint64_t>(kind) <= kOpKindMask);
     return OpTag{
-        (static_cast<uint64_t>(gen) << 32) |
-        (static_cast<uint64_t>(index & 0xFFFFFU) << 12) |
-        (static_cast<uint64_t>(static_cast<uint8_t>(kind) & 0x3FU) << 6) |
-        (static_cast<uint64_t>(static_cast<uint8_t>(pool) & 0x7U) << 3) |
-        static_cast<uint64_t>(aux & 0x7U)};
+        (static_cast<uint64_t>(gen) << kOpGenShift) |
+        ((static_cast<uint64_t>(index) & kOpIndexMask) << kOpIndexShift) |
+        ((static_cast<uint64_t>(kind) & kOpKindMask) << kOpKindShift) |
+        ((static_cast<uint64_t>(pool) & kOpPoolMask) << kOpPoolShift) |
+        (static_cast<uint64_t>(aux) & kOpAuxMask)};
   }
 
   static constexpr OpTag make(OpKind kind, Handle h, uint8_t aux = 0,
@@ -78,19 +109,19 @@ struct OpTag {
   }
 
   [[nodiscard]] constexpr uint32_t gen() const noexcept {
-    return static_cast<uint32_t>(raw >> 32);
+    return static_cast<uint32_t>(raw >> kOpGenShift);
   }
   [[nodiscard]] constexpr uint32_t index() const noexcept {
-    return static_cast<uint32_t>((raw >> 12) & 0xFFFFFU);
+    return static_cast<uint32_t>((raw >> kOpIndexShift) & kOpIndexMask);
   }
   [[nodiscard]] constexpr OpKind kind() const noexcept {
-    return static_cast<OpKind>((raw >> 6) & 0x3FU);
+    return static_cast<OpKind>((raw >> kOpKindShift) & kOpKindMask);
   }
   [[nodiscard]] constexpr PoolId pool() const noexcept {
-    return static_cast<PoolId>((raw >> 3) & 0x7U);
+    return static_cast<PoolId>((raw >> kOpPoolShift) & kOpPoolMask);
   }
   [[nodiscard]] constexpr uint8_t aux() const noexcept {
-    return static_cast<uint8_t>(raw & 0x7U);
+    return static_cast<uint8_t>(raw & kOpAuxMask);
   }
   [[nodiscard]] constexpr Handle handle() const noexcept {
     return Handle{index(), gen()};

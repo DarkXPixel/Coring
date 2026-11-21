@@ -20,7 +20,7 @@
 // for as long as the relay lives.
 //
 // Relaying. Two directions, each with: single-shot recv from provided buffers
-// -> copy into a RelayQueue (the lease is released at once, I10) -> send from
+// -> copy into a ChunkQueue (the lease is released at once, I10) -> send from
 // the queue head (short sends just consume less). At most one recv and one send
 // per direction are in flight.
 //   * Backpressure (I6): a direction stops re-arming its recv when its queue
@@ -40,7 +40,7 @@
 
 #include "coring5/io/ConnCore.hpp"
 #include "coring5/net/UpstreamDialer.hpp"
-#include "coring5/proto/l4/RelayQueue.hpp"
+#include "coring5/mem/ChunkQueue.hpp"
 #include "coring5/upstream/UpstreamPool.hpp"
 
 namespace Coring5 {
@@ -66,7 +66,7 @@ private:
 
   // One direction: dir 0 = client -> upstream, dir 1 = upstream -> client.
   struct Dir {
-    RelayQueue q;
+    ChunkQueue q;
     TimePoint
         progress_at{}; // when the sink last progressed / queue became non-empty
     bool recv_inflight{false};

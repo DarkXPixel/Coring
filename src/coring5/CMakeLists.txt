@@ -37,7 +37,7 @@ endfunction()
 
 # ---- foundations -------------------------------------------------------------
 coring5_module(base SOURCES base/Endpoint.cpp)
-coring5_module(mem  SOURCES mem/Region.cpp mem/ChunkPool.cpp DEPS base)
+coring5_module(mem  SOURCES mem/Region.cpp mem/ChunkPool.cpp mem/ChunkQueue.cpp DEPS base)
 
 # ---- no kernel ring needed (testable anywhere) --------------------------------
 coring5_module(config SOURCES config/Loader.cpp config/Diff.cpp DEPS base)
@@ -48,6 +48,11 @@ endif()                     # else: <toml++/toml.hpp> from the system include pa
 
 coring5_module(obs SOURCES obs/Metrics.cpp DEPS base)
 
+# Sans-IO HTTP building blocks (BodyStream now; Exchange, HeaderBlock later).
+# Deliberately NO dependency on io: testable and fuzzable without a kernel ring.
+coring5_module(http SOURCES http/BodyStream.cpp http/Exchange.cpp
+                    http/ExchangePool.cpp DEPS base mem config)
+
 # ---- io_uring layer ------------------------------------------------------------
 coring5_module(io
   SOURCES io/Ring.cpp io/BufferRing.cpp io/TimerWheel.cpp io/ConnCore.cpp
@@ -57,9 +62,9 @@ coring5_module(upstream SOURCES upstream/UpstreamPool.cpp DEPS base config)
 coring5_module(net SOURCES net/ListenSocket.cpp net/UpstreamDialer.cpp DEPS base io upstream)
 
 # ---- protocols (sans-IO where possible) ---------------------------------------
-coring5_module(proto_http1 SOURCES proto/http1/Parser.cpp DEPS base config)
+coring5_module(proto_http1 SOURCES proto/http1/Parser.cpp proto/http1/ChunkedDecoder.cpp proto/http1/ResponseWriter.cpp DEPS base config)
 coring5_module(proto_l4
-  SOURCES proto/l4/EchoConn.cpp proto/l4/L4Conn.cpp proto/l4/RelayQueue.cpp
+  SOURCES proto/l4/EchoConn.cpp proto/l4/L4Conn.cpp
   DEPS io net upstream)
 # Connection types per protocol (depend on io). proto_http1 stays sans-IO.
 coring5_module(proto_http1conn SOURCES proto/http1conn/Http1Conn.cpp DEPS io proto_http1)

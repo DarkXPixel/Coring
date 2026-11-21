@@ -11,8 +11,12 @@ reuse on a few hot slots: ~65k reuses at tens of thousands of accepts/s).
 
 ## Decision
 * `Handle{uint32 index; uint32 gen}`, `gen == 0` is invalid, `gen` skips 0 on wrap.
-* `OpTag` (64-bit, explicit shifts): `gen:32 | index:20 | kind:6 | aux:6`.
-  Pool capacity ≤ 2^20.
+* `OpTag` (64-bit, explicit shifts): `gen:32 | index:20 | kind:5 | pool:4 |
+  aux:3`. Pool capacity ≤ 2^20, up to 16 pools and 32 operation kinds.
+  (Originally `kind:6 | aux:6`; the pool id was added in the Coring5 skeleton
+  as `pool:3`, and M4.0 widened it to 4 bits by taking one from `kind`, see
+  ADR 0010 §4.4. The field widths live in `io/OpTag.hpp` and are checked there
+  by `static_assert`s.)
 * **`gen` is a tripwire, not the safety mechanism.** For a connection's own ops
   safety comes from ADR 0003 (no CQE can outlive the slot). A stale lookup
   returns `nullptr`, the worker increments `stale_events`, and tests/CI/prod
