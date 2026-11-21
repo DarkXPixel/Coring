@@ -2,7 +2,7 @@
 # "Layering"). tools/check_layering.py verifies the #include graph matches.
 #
 #   apps -> runtime -> {handlers, proto, upstream, tls, control} -> io/net/config/routing -> mem -> base
-#   (proto: http1 = sans-IO parser; http1conn/http2/http3/l4 = connection types, depend on io)
+#   (proto: http1/http1session = sans-IO; http1conn/http2/http3/l4 = connection types, depend on io)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LIBURING REQUIRED IMPORTED_TARGET liburing)
@@ -48,10 +48,10 @@ endif()                     # else: <toml++/toml.hpp> from the system include pa
 
 coring5_module(obs SOURCES obs/Metrics.cpp DEPS base)
 
-# Sans-IO HTTP building blocks (BodyStream now; Exchange, HeaderBlock later).
+# Sans-IO HTTP building blocks (BodyStream, Exchange, ExchangePool).
 # Deliberately NO dependency on io: testable and fuzzable without a kernel ring.
 coring5_module(http SOURCES http/BodyStream.cpp http/Exchange.cpp
-                    http/ExchangePool.cpp DEPS base mem config)
+                    http/ExchangePool.cpp http/Handlers.cpp DEPS base mem config)
 
 # ---- io_uring layer ------------------------------------------------------------
 coring5_module(io
@@ -63,11 +63,14 @@ coring5_module(net SOURCES net/ListenSocket.cpp net/UpstreamDialer.cpp DEPS base
 
 # ---- protocols (sans-IO where possible) ---------------------------------------
 coring5_module(proto_http1 SOURCES proto/http1/Parser.cpp proto/http1/ChunkedDecoder.cpp proto/http1/ResponseWriter.cpp DEPS base config)
+coring5_module(proto_http1session SOURCES proto/http1session/ServerSession.cpp
+                    DEPS base mem config http proto_http1)
 coring5_module(proto_l4
   SOURCES proto/l4/EchoConn.cpp proto/l4/L4Conn.cpp
   DEPS io net upstream)
 # Connection types per protocol (depend on io). proto_http1 stays sans-IO.
-coring5_module(proto_http1conn SOURCES proto/http1conn/Http1Conn.cpp DEPS io proto_http1)
+coring5_module(proto_http1conn SOURCES proto/http1conn/Http1Conn.cpp
+                    DEPS io mem http proto_http1 proto_http1session)
 coring5_module(proto_http2 SOURCES proto/http2/Http2Conn.cpp DEPS io)
 coring5_module(proto_http3 SOURCES proto/http3/Http3Conn.cpp DEPS io)
 
@@ -80,7 +83,7 @@ coring5_module(runtime
   SOURCES
     runtime/Mailbox.cpp runtime/Worker.cpp runtime/WorkerGroup.cpp
     runtime/ConfigManager.cpp runtime/Daemon.cpp
-  DEPS io net upstream proto_l4 proto_http1conn proto_http2 proto_http3 control config obs
+  DEPS io net upstream http proto_l4 proto_http1conn proto_http2 proto_http3 control config obs
   SYSTEM_DEPS Threads::Threads)
 
 # ---- applications ----------------------------------------------------------------

@@ -34,7 +34,7 @@ void EchoConn::send_rest(IoContext &ctx) {
 }
 
 void EchoConn::on_cqe(IoContext &ctx, const Cqe &cqe,
-                      BufferRing::Lease &lease) {
+                      IoBufferRing::Lease &lease) {
   switch (cqe.tag.kind()) {
   case OpKind::Recv: {
     if (cqe.res == -ENOBUFS) {

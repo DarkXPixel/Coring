@@ -113,7 +113,7 @@ void L4Conn::kick_send(IoContext &ctx, unsigned d) {
   D.send_inflight = true;
 }
 
-void L4Conn::on_recv(IoContext &ctx, const Cqe &cqe, BufferRing::Lease &lease,
+void L4Conn::on_recv(IoContext &ctx, const Cqe &cqe, IoBufferRing::Lease &lease,
                      unsigned d) {
   Dir &D = dir_[d];
   D.recv_inflight = false;
@@ -290,7 +290,7 @@ void L4Conn::rearm_timer(IoContext &ctx) {
 
 // -------------------------------------------------------------- CQE / timer
 
-void L4Conn::on_cqe(IoContext &ctx, const Cqe &cqe, BufferRing::Lease &lease) {
+void L4Conn::on_cqe(IoContext &ctx, const Cqe &cqe, IoBufferRing::Lease &lease) {
   const unsigned d = cqe.tag.aux() & 1U;
   switch (cqe.tag.kind()) {
   case OpKind::Connect:

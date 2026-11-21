@@ -22,7 +22,7 @@ public:
   ConnCore core;
 
   void start(IoContext &ctx);
-  void on_cqe(IoContext &ctx, const Cqe &cqe, BufferRing::Lease &lease);
+  void on_cqe(IoContext &ctx, const Cqe &cqe, IoBufferRing::Lease &lease);
   void on_timer(IoContext &ctx, DeadlineKind kind);
   // Finish the response that is being written, then close. Idle: close now.
   void on_drain(IoContext &ctx);
@@ -31,7 +31,7 @@ private:
   void arm_recv(IoContext &ctx);
   void send_rest(IoContext &ctx);
 
-  BufferRing::Lease pending_; // data being echoed; released after the send
+  IoBufferRing::Lease pending_; // data being echoed; released after the send
   uint32_t sent_{0};
 };
 

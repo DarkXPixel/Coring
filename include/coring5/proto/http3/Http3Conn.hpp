@@ -22,7 +22,7 @@ public:
   ConnCore core;
 
   void start(IoContext &ctx);
-  void on_cqe(IoContext &ctx, const Cqe &cqe, BufferRing::Lease &lease);
+  void on_cqe(IoContext &ctx, const Cqe &cqe, IoBufferRing::Lease &lease);
   void on_timer(IoContext &ctx, DeadlineKind kind);
   void on_drain(IoContext &ctx);
 };

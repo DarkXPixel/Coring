@@ -36,7 +36,7 @@ public:
   // Completion for a connection of this pool. Returns false for a stale or
   // invalid handle (the caller bumps `stale_events`, which must stay 0).
   [[nodiscard]] bool on_cqe(IoContext &ctx, const Cqe &cqe,
-                            BufferRing::Lease &lease) {
+                            IoBufferRing::Lease &lease) {
     T *c = pool_.get(cqe.tag.handle());
     if (c == nullptr) [[unlikely]] {
       return false;
@@ -45,6 +45,20 @@ public:
       c->on_cqe(ctx, cqe, lease);
     }
     c->core.end_cqe(ctx);
+    return true;
+  }
+
+  // The exchange pool delivered an exchange whose ingress is connection `h`.
+  // False for a stale handle (the worker then detaches the ingress side).
+  // Types without an on_exchange() hook ignore it.
+  [[nodiscard]] bool on_exchange(IoContext &ctx, Handle h) {
+    T *c = pool_.get(h);
+    if (c == nullptr) [[unlikely]] {
+      return false;
+    }
+    if constexpr (requires { c->on_exchange(ctx); }) {
+      c->on_exchange(ctx);
+    }
     return true;
   }
 

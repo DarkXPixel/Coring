@@ -41,7 +41,9 @@ Worker::~Worker() {
   // Explicit order: connections (fds, timer nodes) first, ring last.
   connections_.reset();
   listeners_.reset();
+  exchanges_.reset(); // returns body chunks: before chunks_/stage_ go away
   upstreams_.reset();
+  stage_ = ChunkPool{};
   chunks_ = ChunkPool{};
   ctx_.reset();
   timers_.reset();
@@ -98,10 +100,12 @@ std::expected<void, std::string> Worker::init() {
                                                Clock::now(),
                                                {}});
 
-  // l4 relay memory: one lazily-faulted slab per worker, only when an l4 pool
-  // exists. Bounded by construction (queues cannot exceed it).
+  // Chunk memory (chunk = buffer_size): one lazily-faulted slab per worker,
+  // only when an l4 or http1 pool exists. Serves l4 relay queues and HTTP/1
+  // body streams. Bounded by construction (queues cannot exceed it).
   upstreams_ = std::make_unique<UpstreamPool>();
-  if (init_.runtime.pool_capacity[pool_index(PoolId::L4)] > 0) {
+  const uint32_t http1_cap = init_.runtime.pool_capacity[pool_index(PoolId::Http1)];
+  if (init_.runtime.pool_capacity[pool_index(PoolId::L4)] > 0 || http1_cap > 0) {
     const uint64_t n =
         (static_cast<uint64_t>(init_.runtime.relay_memory_mib) << 20) /
         init_.runtime.buffer_size;
@@ -114,8 +118,26 @@ std::expected<void, std::string> Worker::init() {
     }
     chunks_ = std::move(*cp);
   }
+  // HTTP/1: one stage chunk per connection (sessions allocate lazily; the slab
+  // is mapped noreserve) and one Exchange per connection (serial sessions).
+  if (http1_cap > 0) {
+    const uint32_t stage_bytes = init_.runtime.http1_stage_effective != 0
+                                     ? init_.runtime.http1_stage_effective
+                                     : init_.runtime.buffer_size;
+    auto sp = ChunkPool::create(stage_bytes, http1_cap);
+    if (!sp) {
+      return std::unexpected(std::format(
+          "worker {}: http1 stage pool failed ({}, errno {})", init_.id.value,
+          to_string(sp.error().code), sp.error().sys));
+    }
+    stage_ = std::move(*sp);
+  }
+  exchanges_ = std::make_unique<ExchangePool>(
+      http1_cap, chunks_, StreamLimits::from(snapshot_->limits));
   ctx_->upstreams = upstreams_.get();
   ctx_->chunks = &chunks_;
+  ctx_->exchanges = exchanges_.get();
+  ctx_->stage = &stage_;
 
   listeners_ =
       std::make_unique<HandlePool<ListenerSlot>>(kMaxListenersPerWorker);
@@ -152,7 +174,10 @@ void Worker::run() {
     return;
   }
   while (!done_) {
-    auto r = ring_->submit_and_wait(1);
+    // Ready exchanges mean there is work that no CQE will announce: never
+    // sleep in the kernel then (submit without waiting).
+    auto r = exchanges_->has_ready() ? ring_->submit_nowait()
+                                     : ring_->submit_and_wait(1);
     if (!r) {
       const int err = r.error().sys;
       if (err != EINTR && err != EBUSY && err != EAGAIN) {
@@ -177,6 +202,8 @@ void Worker::run() {
         inc(init_.metrics->stale_events); // would mean a leaked TimerNode
       }
     });
+
+    drain_exchanges(); // before reap_closed(): may close connections
 
     if (!tick_armed_) {
       arm_tick();
@@ -333,6 +360,7 @@ void Worker::apply(ApplyConfig &msg) {
   if (ok) {
     snapshot_ = msg.snapshot; // drops our ref to the old snapshot
     ctx_->limits = &snapshot_->limits;
+    exchanges_->set_limits(StreamLimits::from(snapshot_->limits));
     upstreams_->apply_config(
         *snapshot_); // copies: no pointer into the snapshot
     set(init_.metrics->config_generation, snapshot_->generation);
@@ -414,6 +442,18 @@ void Worker::maybe_free_listener(Handle h, ListenerSlot &slot) {
   }
 }
 
+void Worker::drain_exchanges() {
+  // Bounded per iteration so a busy pool cannot starve the ring; leftovers keep
+  // has_ready() true and the next submit does not block.
+  constexpr uint32_t kBudget = 1024;
+  exchanges_->drain(kBudget, [this](Handle, Exchange &ex) {
+    if (!connections_->on_exchange(*ctx_, ex.ingress().conn)) {
+      // Ingress connection is gone (normal for peer links): let E11 reap it.
+      ex.detach(Side::Ingress, Errc::Shutdown);
+    }
+  });
+}
+
 void Worker::reap_closed() {
   if (ctx_->closed.empty()) {
     return;
@@ -443,7 +483,8 @@ void Worker::check_shutdown_progress() {
     phase_ = Phase::Stopping;
     connections_->close_all(*ctx_, Errc::Timeout);
   }
-  if (connections_->live() == 0 && listeners_->live() == 0) {
+  if (connections_->live() == 0 && listeners_->live() == 0 &&
+      !exchanges_->has_ready() && exchanges_->live() == 0) {
     done_ = true;
   } else if (phase_ == Phase::Stopping &&
              now >= drain_deadline_ + kHardStopGrace) {

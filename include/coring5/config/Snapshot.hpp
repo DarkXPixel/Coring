@@ -38,6 +38,15 @@ struct RuntimeConfig {
   // Mapped lazily (pages are committed on first use); only allocated when an
   // l4 pool exists. Chunk size equals buffer_size.
   uint32_t relay_memory_mib{256};
+  // HTTP/1 stage chunk size (partial heads, blocked/pipelined tails). 0 = auto
+  // (`limits.max_head_bytes + buffer_size` of the first config). Explicit values
+  // must be >= that sum and <= 8 MiB. Restart-only (part of equality); every
+  // load and reload is checked against the EFFECTIVE size below.
+  uint32_t http1_stage_bytes{0};
+  // Effective stage size workers allocate. Computed by parse_config(); NOT part
+  // of equality (auto mode follows the limits); like pool_capacity, the first
+  // configuration fixes it and reloads must fit.
+  uint32_t http1_stage_effective{0};
   Millis tick{50};             // timer wheel resolution / idle wakeup period
   Millis drain_timeout{10000}; // graceful shutdown deadline
   Millis reload_ack_timeout{5000};
@@ -59,7 +68,8 @@ struct RuntimeConfig {
            buffer_count == o.buffer_count && buffer_size == o.buffer_size &&
            ring_sq_entries == o.ring_sq_entries &&
            ring_cq_entries == o.ring_cq_entries &&
-           relay_memory_mib == o.relay_memory_mib && tick == o.tick &&
+           relay_memory_mib == o.relay_memory_mib &&
+           http1_stage_bytes == o.http1_stage_bytes && tick == o.tick &&
            drain_timeout == o.drain_timeout &&
            reload_ack_timeout == o.reload_ack_timeout && pools == o.pools;
   }
@@ -76,6 +86,10 @@ struct Limits {
   uint32_t max_uri_bytes{8 * 1024};
   uint32_t queue_high_watermark{256 * 1024};
   uint32_t queue_low_watermark{64 * 1024};
+  // HTTP/1 server session: requests served per connection (0 = unlimited) and
+  // max request body size (0 = unlimited; over it -> 413 / abort TooLarge).
+  uint32_t max_requests{1000};
+  uint64_t max_request_body_bytes{0};
 
   bool operator==(const Limits &) const = default;
 };

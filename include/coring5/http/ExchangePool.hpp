@@ -22,6 +22,9 @@ class ExchangePool {
 public:
   ExchangePool(uint32_t capacity, ChunkPool &chunks, StreamLimits limits);
 
+  // Applies to Exchanges opened AFTER the call; live ones keep theirs (a reload
+  // never changes watermarks under an in-flight body).
+  void set_limits(StreamLimits limits) noexcept { limits_ = limits; }
   // Full => invalid handle (the ingress answers 503 itself).
   [[nodiscard]] Handle open(SideRef ingress, RequestMeta meta) noexcept;
   // nullptr if stale/invalid.

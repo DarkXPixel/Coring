@@ -50,27 +50,31 @@ TEST(Http1Head, KeepAliveRules) {
   ASSERT_EQ(parse("GET / HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", h).status,
             ParseStatus::Done);
   EXPECT_TRUE(h.keep_alive);
-  ASSERT_EQ(parse("GET / HTTP/1.1\r\nConnection: close\r\n\r\n", h).status,
-            ParseStatus::Done);
+  ASSERT_EQ(
+      parse("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", h).status,
+      ParseStatus::Done);
   EXPECT_FALSE(h.keep_alive);
 }
 
 TEST(Http1Head, BodyFramingHeaders) {
   RequestHead h;
-  ASSERT_EQ(parse("POST / HTTP/1.1\r\nContent-Length: 42\r\n\r\n", h).status,
+  ASSERT_EQ(parse("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 42\r\n\r\n", h)
+                .status,
             ParseStatus::Done);
   EXPECT_TRUE(h.has_content_length);
   EXPECT_EQ(h.content_length, 42U);
-  ASSERT_EQ(
-      parse("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n", h).status,
-      ParseStatus::Done);
+  ASSERT_EQ(parse("POST / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: "
+                  "chunked\r\n\r\n",
+                  h)
+                .status,
+            ParseStatus::Done);
   EXPECT_TRUE(h.chunked);
   // identical duplicate CL is tolerated, conflicting is not (below)
-  ASSERT_EQ(
-      parse("POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n",
-            h)
-          .status,
-      ParseStatus::Done);
+  ASSERT_EQ(parse("POST / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n"
+                  "Content-Length: 5\r\n\r\n",
+                  h)
+                .status,
+            ParseStatus::Done);
 }
 
 // ---- request smuggling / malformed input: every case must be REJECTED ------

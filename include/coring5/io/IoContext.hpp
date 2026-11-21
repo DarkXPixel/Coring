@@ -7,8 +7,7 @@
 
 #include "coring5/base/Types.hpp"
 #include "coring5/config/Snapshot.hpp"
-#include "coring5/io/BufferRing.hpp"
-#include "coring5/io/Ring.hpp"
+#include "coring5/io/RingSeam.hpp"
 #include "coring5/io/TimerWheel.hpp"
 #include "coring5/mem/ChunkPool.hpp"
 #include "coring5/obs/Metrics.hpp"
@@ -16,12 +15,12 @@
 
 namespace Coring5 {
 
-class UpstreamPool; // upstream/UpstreamPool.hpp (kept out of io's include
-                    // graph)
+class UpstreamPool;  // upstream/UpstreamPool.hpp (kept out of io's include graph)
+class ExchangePool;  // http/ExchangePool.hpp (io never includes http)
 
 struct IoContext {
-  Ring &ring;
-  BufferRing &buffers;
+  IoRing &ring;
+  IoBufferRing &buffers;
   TimerWheel &timers;
   WorkerMetrics &metrics;
   const Limits *limits{nullptr}; // swapped by the worker on config apply
@@ -38,6 +37,11 @@ struct IoContext {
   // when no l4 listener exists.
   UpstreamPool *upstreams{nullptr};
   ChunkPool *chunks{nullptr};
+
+  // HTTP/1 services (null/empty without an http1 pool): the Exchange pool and
+  // the stage ChunkPool (chunk = http1_stage_bytes). Outlive every connection.
+  ExchangePool *exchanges{nullptr};
+  ChunkPool *stage{nullptr};
 
   // Set by the worker immediately before ConnPool::spawn(); read once by the
   // new connection's start(). Plain ids (invariant I8), never snapshot

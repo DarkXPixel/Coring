@@ -16,6 +16,7 @@
 #include "coring5/io/BufferRing.hpp"
 #include "coring5/io/IoContext.hpp"
 #include "coring5/io/Ring.hpp"
+#include "coring5/http/ExchangePool.hpp"
 #include "coring5/io/TimerWheel.hpp"
 #include "coring5/mem/ChunkPool.hpp"
 #include "coring5/mem/HandlePool.hpp"
@@ -81,6 +82,7 @@ private:
   void maybe_free_listener(Handle h, ListenerSlot &slot);
   void arm_tick();
   void arm_mailbox();
+  void drain_exchanges();
   void reap_closed();
   void publish_pool_gauges();
   void check_shutdown_progress();
@@ -92,10 +94,15 @@ private:
   std::unique_ptr<TimerWheel> timers_;
   std::shared_ptr<const ConfigSnapshot> snapshot_;
   std::unique_ptr<IoContext> ctx_;
-  // l4 services. Declared BEFORE connections_ and destroyed AFTER it: a
-  // connection's destructor returns its queued chunks / backend accounting.
+  // l4 / http1 services. Declared BEFORE connections_ and destroyed AFTER it: a
+  // connection's destructor returns its chunks / backend accounting / detaches
+  // its exchange. `chunks_` (chunk = buffer_size) feeds relay queues and body
+  // streams; `stage_` feeds HTTP/1 sessions. exchanges_ is destroyed before
+  // both chunk pools (its streams return chunks).
   ChunkPool chunks_;
+  ChunkPool stage_;
   std::unique_ptr<UpstreamPool> upstreams_;
+  std::unique_ptr<ExchangePool> exchanges_;
   std::unique_ptr<HandlePool<ListenerSlot>> listeners_;
   std::unique_ptr<ConnPools> connections_;
 

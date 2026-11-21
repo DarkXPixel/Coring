@@ -64,9 +64,14 @@ public:
 
   // False for a stale or invalid handle.
   [[nodiscard]] bool on_cqe(IoContext &ctx, const Cqe &cqe,
-                            BufferRing::Lease &lease) {
+                            IoBufferRing::Lease &lease) {
     return visit(cqe.tag.pool(),
                  [&](auto &p) { return p.on_cqe(ctx, cqe, lease); });
+  }
+
+  // Delivers an exchange event to its ingress connection; false if stale.
+  [[nodiscard]] bool on_exchange(IoContext &ctx, ConnRef c) {
+    return visit(c.pool, [&](auto &p) { return p.on_exchange(ctx, c.handle); });
   }
 
   [[nodiscard]] bool on_timer(IoContext &ctx, PoolId id, Handle h,

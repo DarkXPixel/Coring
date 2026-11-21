@@ -31,7 +31,7 @@
 //   explicit T(FdOwner);                    constructed in place in its slot
 //   ConnCore core;                          public
 //   void start(IoContext&);
-//   void on_cqe(IoContext&, const Cqe&, BufferRing::Lease&);
+//   void on_cqe(IoContext&, const Cqe&, IoBufferRing::Lease&);
 //   void on_timer(IoContext&, DeadlineKind);
 //   void on_drain(IoContext&);              finish current work, then close
 //
@@ -131,7 +131,7 @@ private:
 
 template <class T>
 concept ConnectionType = requires(T &c, IoContext &ctx, const Cqe &cqe,
-                                  BufferRing::Lease &lease, DeadlineKind kind) {
+                                  IoBufferRing::Lease &lease, DeadlineKind kind) {
   { T::kPool } -> std::convertible_to<PoolId>;
   { c.core } -> std::same_as<ConnCore &>;
   c.start(ctx);

@@ -23,6 +23,14 @@ ConfigManager::apply(ParsedConfig parsed) {
         "the [runtime] section changed: restart required (hot reload covers "
         "[limits] and [[listener]] only)");
   }
+  if (have_runtime_ &&
+      static_cast<uint64_t>(parsed.limits.max_head_bytes) +
+              parsed.runtime.buffer_size >
+          runtime_.http1_stage_effective) {
+    return std::unexpected(
+        "[limits] max_head_bytes + [runtime] buffer_size exceeds the HTTP/1 "
+        "stage size workers started with (http1_stage_bytes): restart required");
+  }
   if (!have_runtime_ && !workers_.running()) {
     return std::unexpected("workers are not running");
   }

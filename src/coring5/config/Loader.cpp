@@ -33,8 +33,8 @@ std::expected<ProtocolKind, std::string> parse_protocol(std::string_view s) {
   return std::unexpected(std::format("unknown protocol '{}'", s));
 }
 
-// Which protocols a listener may use today (docs/ROADMAP.md). l4 and http1 are
-// operational stubs (they accept and answer/close with a labelled reason);
+// Which protocols a listener may use today (docs/ROADMAP.md). l4 relays; http1 runs
+// the real session (keep-alive, bodies) but answers 501 until handlers land;
 // http2/http3 stay rejected: a listener that can only close is a footgun in a
 // real configuration, even though their pools exist.
 bool protocol_implemented(ProtocolKind p) {
@@ -163,6 +163,7 @@ ConfigResult parse_config(std::string_view text) {
     C5_TRY(read_uint(*rt, "ring_sq_entries", r.ring_sq_entries, "runtime"));
     C5_TRY(read_uint(*rt, "ring_cq_entries", r.ring_cq_entries, "runtime"));
     C5_TRY(read_uint(*rt, "relay_memory_mib", r.relay_memory_mib, "runtime"));
+    C5_TRY(read_uint(*rt, "http1_stage_bytes", r.http1_stage_bytes, "runtime"));
     C5_TRY(read_ms(*rt, "tick_ms", r.tick, "runtime"));
     C5_TRY(read_ms(*rt, "drain_timeout_ms", r.drain_timeout, "runtime"));
     C5_TRY(
@@ -211,6 +212,9 @@ ConfigResult parse_config(std::string_view text) {
                      "limits"));
     C5_TRY(
         read_uint(*lt, "queue_low_watermark", l.queue_low_watermark, "limits"));
+    C5_TRY(read_uint(*lt, "max_requests", l.max_requests, "limits"));
+    C5_TRY(read_uint(*lt, "max_request_body_bytes", l.max_request_body_bytes,
+                     "limits"));
   } else if (root.contains("limits")) {
     return std::unexpected("'limits' must be a table");
   }
@@ -308,6 +312,14 @@ ConfigResult parse_config(std::string_view text) {
         "'listener' must be an array of tables ([[listener]])");
   }
 
+  {
+    const uint64_t need = static_cast<uint64_t>(out.limits.max_head_bytes) +
+                          out.runtime.buffer_size;
+    const uint64_t eff =
+        out.runtime.http1_stage_bytes != 0 ? out.runtime.http1_stage_bytes : need;
+    out.runtime.http1_stage_effective =
+        eff > 0xFFFFFFFFULL ? 0xFFFFFFFFU : static_cast<uint32_t>(eff);
+  }
   out.runtime.pool_capacity =
       derive_pool_capacities(out.runtime, out.listeners);
   return out;
@@ -441,6 +453,20 @@ std::expected<void, std::string> validate_config(const ParsedConfig &cfg) {
   }
   if (l.max_head_bytes < 256 || l.max_headers == 0 || l.max_uri_bytes == 0) {
     return std::unexpected("[limits] head/header/uri limits too small");
+  }
+  if (l.queue_high_watermark < r.buffer_size) {
+    return std::unexpected(
+        "[limits] queue_high_watermark must be >= [runtime] buffer_size");
+  }
+  // HTTP/1 session staging chunk: http1_stage_bytes >= max_head_bytes +
+  // buffer_size (re-checked on every reload: limits may grow, the chunk may not).
+  if (static_cast<uint64_t>(l.max_head_bytes) + r.buffer_size >
+      r.http1_stage_effective) {
+    return std::unexpected("[runtime] http1_stage_bytes must be >= [limits] "
+                           "max_head_bytes + [runtime] buffer_size");
+  }
+  if (r.http1_stage_effective > (8U << 20)) {
+    return std::unexpected("[runtime] http1_stage_bytes must be <= 8 MiB");
   }
 
   if (r.relay_memory_mib == 0 || r.relay_memory_mib > 65536) {

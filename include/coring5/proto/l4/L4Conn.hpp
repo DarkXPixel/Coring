@@ -57,7 +57,7 @@ public:
   ConnCore core;
 
   void start(IoContext &ctx);
-  void on_cqe(IoContext &ctx, const Cqe &cqe, BufferRing::Lease &lease);
+  void on_cqe(IoContext &ctx, const Cqe &cqe, IoBufferRing::Lease &lease);
   void on_timer(IoContext &ctx, DeadlineKind kind);
   void on_drain(IoContext &ctx);
 
@@ -83,7 +83,7 @@ private:
   void start_relay(IoContext &ctx);
 
   // relay phase
-  void on_recv(IoContext &ctx, const Cqe &cqe, BufferRing::Lease &lease,
+  void on_recv(IoContext &ctx, const Cqe &cqe, IoBufferRing::Lease &lease,
                unsigned d);
   void on_send(IoContext &ctx, const Cqe &cqe, unsigned d);
   void on_shutdown(IoContext &ctx, unsigned d);

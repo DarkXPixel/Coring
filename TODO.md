@@ -13,11 +13,12 @@ Side items: M1 `FakeRing` + randomized lifecycle tests; M2 event-driven `Control
 
 (Layout: headers `include/coring5/<mod>/`, sources `src/coring5/<mod>/`, tests `tests/coring5/`.)
 
-- `include/coring5/proto/http1/` + `src/coring5/proto/http1/` (BodyFraming, ChunkedDecoder)
-- `include/coring5/http/` + `src/coring5/http/` (BodyStream, Exchange)
-- `include/coring5/mem/` (ChunkQueue)
-- `include/coring5/io/` + `src/coring5/io/` (FakeRing seam, server session wiring)
-- `tests/coring5/unit/` (chunked/framing tests), `tests/coring5/integration/`
+- `include/coring5/proto/http1/` + `src/coring5/proto/http1/` (BodyFraming, ChunkedDecoder, ResponseWriter)
+- `include/coring5/proto/http1session/` + `src/coring5/proto/http1session/` (ServerSession, sans-IO)
+- `include/coring5/http/` + `src/coring5/http/` (BodyStream, Exchange, ExchangePool)
+- `include/coring5/mem/` (ChunkQueue, ChunkPool)
+- `tests/coring5/unit/` (chunked/framing/session tests), `tests/coring5/integration/`
+- S2 only: `proto/http1conn`, `runtime/Worker`, `io/` (FakeRing)
 - TBD: `src/coring5/routing/` -> fold into ConfigSnapshot; ControlServer location
 
 ## Current State & Progress
@@ -46,12 +47,12 @@ Side items: M1 `FakeRing` + randomized lifecycle tests; M2 event-driven `Control
   - [x] Trailers: validated (token name, no obs-fold, no SP before ':', no CTL), forbidden framing/hop-by-hop names rejected,
         `max_headers`/`max_head_bytes` per block; contents discarded + counted (request trailers dropped, EXCHANGE.md 5.3)
   - [x] Errors: size/limit overflow -> `Errc::TooLarge`; all else + premature EOF (`on_eof`) -> `Errc::ProtocolViolation`; sticky Failed; `reason` enum for tests
-  - [ ] Caller contract (session, later): claim -> feed -> `push`(Data, settles claim) / `finish(false)`(Done) / `abort(Req, err)`; no `set_declared` for chunked
+  - [x] Caller contract (ServerSession implements it; tick after S1 tests pass): claim -> feed -> `push`(Data, settles claim) / `finish(false)`(Done) / `abort(Req, err)`; no `set_declared` for chunked
   - [x] CMake: ChunkedDecoder.cpp into `proto_http1` (unit target pending); target `coring5_unit_chunked` (LIBS coring5_http coring5_proto_http1); layering 0 violations; -Werror
   - [x] `tests/coring5/unit/chunked_decoder_test.cpp`: happy path, split invariance (byte-by-byte + seeded random splits), pipelined tail,
         NeedCredit/max_data, hex overflow, ext accept/reject, trailers accept/reject/limits, EOF at every state, sticky error, BodyStream integration + pool leak check
   - Note: bare LF right after chunk-size digits -> `BadChunkSize`; `max_ext_bytes` counts the terminating `\r` (`;abc\r` = 5 bytes)
-  - [ ] Decide: BWS in ext (default reject), forbidden trailer-name set, `max_ext_bytes` default 1024, config key for max body
+  - [x] Decided: BWS in ext rejected, `max_ext_bytes` = 1024, config key `limits.max_request_body_bytes` (0 = unlimited)
   - [ ] Out of scope: stored trailer block, session wiring/tail staging, smuggling corpus (M4.1d), fuzz target (M4.1e), HTTP/1.0+chunked check
 
 - [x] M4.1d Smuggling corpus tests (CL+TE, bad chunk sizes, obs-fold)
@@ -61,11 +62,37 @@ Side items: M1 `FakeRing` + randomized lifecycle tests; M2 event-driven `Control
 - [x] M4.1e Fuzz target for body framing (`tests/coring5/fuzz/http1_body.cpp`, `fuzz_http1_body`; opt-in CORING5_FUZZ)
 - [x] Response serializer (`proto/http1/ResponseWriter.{hpp,cpp}`; `response_writer_test.cpp`, target `coring5_unit_response_writer`)
 - [ ] Server session (keep-alive, pipelining policy, `Expect: 100-continue`)
-- [ ] Handlers: Respond / Redirect
+  - Decided defaults: `max_requests = 1000`; `limits.max_request_body_bytes` (0 = unlimited); stage chunk = `max_head_bytes + buffer_size`;
+    BWS in chunk-ext rejected; `max_ext_bytes = 1024`; early final response => close; only `100` interim forwarded
+  - [ ] S0 prerequisites
+    - [x] Fix `coring5_unit_http1` KeepAliveRules/BodyFramingHeaders test heads (add Host) (test pass, left for DeepSeek)
+    - [x] `limits.max_request_body_bytes` + `max_requests` (Snapshot, Loader parse; Diff via Limits `==`); [x] config tests
+    - [x] Validate `queue_high_watermark >= buffer_size`; stage sizing check (`max_head_bytes + buffer_size` <= 8 MiB); [ ] worker creates stage ChunkPool (S2)
+    - [x] Module `proto/http1session`: CMake, `tools/check_layering.py` (+http/http1session for http1conn/runtime), 0 violations
+  - [x] S1 sans-IO `ServerSession` implemented (builds -Werror clean); [x] unit tests pending (DeepSeek)
+    - [x] Rx states, head staging, `on_data` consumes all input, RequestMeta, 503/400/414/431/413/417 + close
+    - [x] Caller contract: prepare_recv (claim) -> on_data (push settles / release) -> finish / abort; Blocked parks tail in stage, resumes on ReqWritable
+    - [x] Tx: static 100, head via ResponseWriter (+ small-body coalescing), CL/chunked payload from front(Res) + consume in on_sent, abort after head -> close
+    - [x] `keep_alive_after` constexpr predicate + `connection_token`; HTTP/1.0 close-delimited => close
+    - [x] Pipelining serial; no recv while Held; early final response => close + cancel_request_body
+    - [x] Expect rules; [x] Deadlines + `on_drain`
+    - [x] `tests/coring5/unit/server_session_test.cpp` (target `coring5_unit_server_session`; end state: pools full, live()==0)
+    - [x] Tick M4.1c "Caller contract" + parent when tests pass
+  - [ ] S2 wiring (code done, build + layering + ctest green; tests left for DeepSeek)
+    - [x] `runtime.http1_stage_bytes` (+ `http1_stage_effective`, restart-only, checked vs `max_head_bytes + buffer_size` on load/reload); `ExchangePool::set_limits`
+    - [x] `ServerSession::close_reason()`, `refresh_limits()` (between requests only)
+    - [x] `Ring::submit_nowait()`, `io/Cqe.hpp`, `io/RingSeam.hpp`, `io/FakeRing.hpp` (`CORING5_FAKE_RING`)
+    - [x] `Http1Conn` on ServerSession (still synthetic 501 until handlers), `ConnPool/ConnPools::on_exchange`
+    - [x] Worker: `exchanges_`, `stage_`, `drain_exchanges()` before `reap_closed()`, nowait submit when `has_ready()`, shutdown needs `live()==0`
+    - [x] FakeRing lifecycle test (close at every state); INVARIANTS checklist walk-through
+          (`tests/coring5/unit/http1_conn_fake_test.cpp` + `http1_conn_harness.hpp`: seeded 1000 seeds x <=12 steps,
+          close trigger from every state, short sends, late/stale CQEs, timer/drain/EOF/error; end state
+          live()==0, inflight==0, stale_events==0, pools full, no leaked fds)
+- [x] Handlers: Respond / Redirect (`http/Handlers.{hpp,cpp}`; `tests/coring5/unit/handlers_test.cpp`, target `coring5_unit_handlers`; cold-path validation + apply() state machine, 32 tests)
 - [ ] Handlers: StaticFile (statx cache, Range, ETag, path-escape tests)
 - [ ] Handlers: ReverseProxy (hop-by-hop strip, X-Forwarded-*, retries idempotent only)
 - [ ] Router integration into ConfigSnapshot
-- [ ] M1: `FakeRing` (same API as Ring, scripted CQEs) + seeded lifecycle tests
+- [ ] M1: `FakeRing` (io/FakeRing.hpp + RingSeam done; [x] seeded lifecycle tests, Worker not yet templated on the seam)
 - [ ] M2: event-driven `ControlServer`; access-log SPSC writer
 
 ## Key Decisions & Invariants

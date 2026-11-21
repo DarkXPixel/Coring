@@ -8,7 +8,7 @@ void Http3Conn::start(IoContext &ctx) {
   core.close(ctx, Errc::Unsupported);
 }
 
-void Http3Conn::on_cqe(IoContext &, const Cqe &, BufferRing::Lease &) {}
+void Http3Conn::on_cqe(IoContext &, const Cqe &, IoBufferRing::Lease &) {}
 
 void Http3Conn::on_timer(IoContext &ctx, DeadlineKind) {
   core.close(ctx, Errc::Timeout);

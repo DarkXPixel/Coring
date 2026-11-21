@@ -12,7 +12,7 @@ void Http2Conn::start(IoContext &ctx) {
   }
 }
 
-void Http2Conn::on_cqe(IoContext &ctx, const Cqe &cqe, BufferRing::Lease &) {
+void Http2Conn::on_cqe(IoContext &ctx, const Cqe &cqe, IoBufferRing::Lease &) {
   if (cqe.tag.kind() != OpKind::Recv) {
     return;
   }

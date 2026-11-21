@@ -255,6 +255,14 @@ Result<unsigned> Ring::submit() noexcept {
   return static_cast<unsigned>(rc);
 }
 
+Result<unsigned> Ring::submit_nowait() noexcept {
+  const int rc = io_uring_submit_and_get_events(&ring_);
+  if (rc < 0) {
+    return unexpected_error(Errc::Internal, -rc);
+  }
+  return static_cast<unsigned>(rc);
+}
+
 void Ring::flush_events() noexcept { (void)io_uring_get_events(&ring_); }
 
 bool Ring::cq_overflowed() const noexcept {

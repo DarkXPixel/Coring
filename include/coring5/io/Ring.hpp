@@ -12,10 +12,11 @@
 //    count it as in-flight) and shed load. They never dereference a null SQE
 //    and never terminate().
 //
-// This header is the seam used by tests: tests/coring5/support/FakeRing.hpp
-// mirrors this API (see docs/TESTING.md, "FakeRing").
+// Tests substitute io/FakeRing.hpp for this class through io/RingSeam.hpp
+// (CORING5_FAKE_RING); it mirrors the API below (see docs/TESTING.md).
 
 #include "coring5/base/Result.hpp"
+#include "coring5/io/Cqe.hpp"
 #include "coring5/io/OpTag.hpp"
 #include <cstdint>
 #include <liburing.h>
@@ -39,25 +40,6 @@ struct RingCaps {
   bool splice{false};
   bool multishot_recv{false}; // kernel >= 6.0
   bool buf_ring{false};       // kernel >= 5.19
-};
-
-struct Cqe {
-  OpTag tag;
-  int32_t res;
-  uint32_t flags;
-
-  [[nodiscard]] bool more() const noexcept {
-    return (flags & IORING_CQE_F_MORE) != 0U;
-  }
-  [[nodiscard]] bool has_buffer() const noexcept {
-    return (flags & IORING_CQE_F_BUFFER) != 0U;
-  }
-  [[nodiscard]] bool is_notif() const noexcept {
-    return (flags & IORING_CQE_F_NOTIF) != 0U;
-  }
-  [[nodiscard]] uint16_t buffer_id() const noexcept {
-    return static_cast<uint16_t>(flags >> IORING_CQE_BUFFER_SHIFT);
-  }
 };
 
 class Ring {
@@ -110,6 +92,12 @@ public:
   [[nodiscard]] Result<unsigned>
   submit_and_wait(unsigned min_complete) noexcept;
   [[nodiscard]] Result<unsigned> submit() noexcept;
+  // Submits pending SQEs WITHOUT waiting and (DEFER_TASKRUN) runs deferred task
+  // work so already-completed CQEs are visible to the reap that follows. Used
+  // instead of submit_and_wait when the worker has ready work. Errors are the
+  // same as submit_and_wait's; EINTR/EBUSY/EAGAIN are retryable by the caller
+  // (Worker::run), which must still run the rest of its iteration.
+  [[nodiscard]] Result<unsigned> submit_nowait() noexcept;
   // Asks the kernel to run deferred task work and flush CQ-overflow entries
   // into the CQ. Used after EBUSY from submit_and_wait: without it the reap
   // that follows could see an empty CQ forever (livelock). Errors are ignored.
