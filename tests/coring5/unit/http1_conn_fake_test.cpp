@@ -137,6 +137,47 @@ TEST(Http1ConnFake, LateCqeAfterCloseIsNotDeliveredToTheProtocol) {
   h.expect_clean_end();
 }
 
+TEST(Http1ConnFake, DeliveryAfterIngressReapDrainsBothExchanges) {
+  ConnHarness h;
+  h.deliver_recv(req("GET", "/"));
+  auto &exchanges = h.exchanges();
+  const Handle session_exchange = h.session().exchange();
+  ASSERT_NE(exchanges.get(session_exchange), nullptr);
+
+  // The session releases its own exchange on close. Leave another exchange
+  // attached to the same ingress so delivery has to detach it.
+  const SideRef ingress{ConnRef{PoolId::Http1, h.c().core.handle()}, 0};
+  const Handle orphan = exchanges.open(ingress, RequestMeta{});
+  ASSERT_TRUE(orphan.valid());
+  h.c().core.close(h.ctx(), Errc::Shutdown);
+  h.flush_pending();
+  ASSERT_TRUE(h.closed());
+  h.reap_closed();
+
+  const auto stale_before = get(h.metrics().stale_events);
+  const auto *detached = exchanges.get(session_exchange);
+  ASSERT_NE(detached, nullptr);
+  ASSERT_TRUE(detached->ingress_detached());
+  ASSERT_EQ(detached->responder_state(), Exchange::ResponderState::None);
+  const auto *attached = exchanges.get(orphan);
+  ASSERT_NE(attached, nullptr);
+  ASSERT_FALSE(attached->ingress_detached());
+  ASSERT_EQ(attached->responder_state(), Exchange::ResponderState::None);
+
+  h.drain_exchanges(1);
+  EXPECT_EQ(exchanges.get(session_exchange), nullptr);
+  const auto *forced = exchanges.get(orphan);
+  ASSERT_NE(forced, nullptr);
+  EXPECT_TRUE(forced->ingress_detached());
+  EXPECT_NE(forced->pending_events(Side::Responder) & ExEvent::kPeerDetached, 0);
+  EXPECT_TRUE(exchanges.has_ready());
+
+  h.drain_exchanges(1);
+  EXPECT_EQ(exchanges.live(), 0U);
+  EXPECT_FALSE(exchanges.has_ready());
+  EXPECT_EQ(get(h.metrics().stale_events), stale_before);
+}
+
 TEST(Http1ConnFake, StaleHandleIsRejectedByThePool) {
   // Exercise the ConnPool dispatch (I4): a CQE whose generation does not match
   // the live slot must be reported as stale, never delivered.

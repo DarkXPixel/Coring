@@ -29,25 +29,21 @@ bool iequals(std::string_view a, std::string_view b) noexcept {
 
 Error err(Errc c) noexcept { return Error{c, 0}; }
 
-} // namespace
-
-bool valid_static_header_name(std::string_view n) noexcept {
-  return !n.empty() && n.size() <= 256 &&
-         std::all_of(n.begin(), n.end(), [](char c) {
-           return is_tchar(static_cast<unsigned char>(c));
-         });
+bool valid_header_name(std::string_view n) noexcept {
+  return !n.empty() && std::all_of(n.begin(), n.end(), [](char c) {
+    return is_tchar(static_cast<unsigned char>(c));
+  });
 }
 
-bool valid_static_header_value(std::string_view v) noexcept {
-  return v.size() <= kMaxStaticHeaderBytes &&
-         std::all_of(v.begin(), v.end(), [](char ch) {
-           const auto c = static_cast<unsigned char>(ch);
-           return c == '\t' || (c >= 0x20 && c != 0x7f);
-         });
+bool valid_header_value(std::string_view v) noexcept {
+  return std::all_of(v.begin(), v.end(), [](char ch) {
+    const auto c = static_cast<unsigned char>(ch);
+    return c == '\t' || (c >= 0x20 && c != 0x7f);
+  });
 }
 
-bool forbidden_static_header(std::string_view n) noexcept {
-  static constexpr std::array<std::string_view, 11> kNames{
+bool framing_or_hop_by_hop(std::string_view n) noexcept {
+  static constexpr std::array<std::string_view, 10> kNames{
       "content-length",
       "transfer-encoding",
       "connection",
@@ -57,10 +53,88 @@ bool forbidden_static_header(std::string_view n) noexcept {
       "trailer",
       "upgrade",
       "proxy-authenticate",
-      "proxy-authorization",
-      "expect"};
+      "proxy-authorization"};
   return std::any_of(kNames.begin(), kNames.end(),
                      [&](std::string_view k) { return iequals(n, k); });
+}
+
+std::string_view next_connection_option(std::string_view &list) noexcept {
+  const auto comma = list.find(',');
+  const auto option = list.substr(0, comma);
+  list = comma == list.npos ? std::string_view{} : list.substr(comma + 1);
+  const auto first = option.find_first_not_of(" \t");
+  if (first == option.npos) {
+    return {};
+  }
+  return option.substr(first, option.find_last_not_of(" \t") - first + 1);
+}
+
+bool nominated(std::span<const ProxyHeader> headers,
+               std::string_view name) noexcept {
+  for (const auto &header : headers) {
+    if (iequals(header.name, "connection")) {
+      auto list = header.value;
+      while (!list.empty()) {
+        if (iequals(next_connection_option(list), name)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+Result<std::size_t> filter_headers(std::span<const ProxyHeader> input,
+                                   std::span<ProxyHeader> output,
+                                   bool request) noexcept {
+  bool has_connection_options = false;
+  for (const auto &header : input) {
+    if (!valid_header_name(header.name) || !valid_header_value(header.value)) {
+      return unexpected_error(Errc::ProtocolViolation);
+    }
+    if (iequals(header.name, "connection")) {
+      auto list = header.value;
+      while (!list.empty()) {
+        const auto option = next_connection_option(list);
+        if (!option.empty() && !valid_header_name(option)) {
+          return unexpected_error(Errc::ProtocolViolation);
+        }
+        has_connection_options |= !option.empty();
+      }
+    }
+  }
+  std::size_t used = 0;
+  constexpr std::string_view forwarded_prefix = "x-forwarded-";
+  for (const auto &header : input) {
+    const auto name = header.name;
+    if (framing_or_hop_by_hop(name) ||
+        iequals(name, "proxy-authentication-info") ||
+        (request && (iequals(name, "forwarded") ||
+                     iequals(name.substr(0, forwarded_prefix.size()),
+                             forwarded_prefix))) ||
+        (has_connection_options && nominated(input, name))) {
+      continue;
+    }
+    if (used == output.size()) {
+      return unexpected_error(Errc::TooLarge);
+    }
+    output[used++] = header;
+  }
+  return used;
+}
+
+} // namespace
+
+bool valid_static_header_name(std::string_view n) noexcept {
+  return n.size() <= 256 && valid_header_name(n);
+}
+
+bool valid_static_header_value(std::string_view v) noexcept {
+  return v.size() <= kMaxStaticHeaderBytes && valid_header_value(v);
+}
+
+bool forbidden_static_header(std::string_view n) noexcept {
+  return framing_or_hop_by_hop(n) || iequals(n, "expect");
 }
 
 Result<Respond> Respond::make(uint16_t status,
@@ -110,7 +184,7 @@ Result<ApplyStatus> Respond::apply(Exchange &ex,
   }
   while (cur.sent < body_.size()) {
     const auto want = static_cast<uint32_t>(
-        std::min<std::size_t>(body_.size() - cur.sent, UINT32_MAX));
+        std::min<uint64_t>(body_.size() - cur.sent, UINT32_MAX));
     const ClaimResult c = ex.claim(StreamId::Res, want);
     if (c.status == ClaimStatus::Blocked) {
       return ApplyStatus::Blocked;
@@ -151,6 +225,69 @@ Result<Redirect> Redirect::make(uint16_t status, std::string_view location) {
     return std::unexpected(r.error());
   }
   return Redirect(std::move(*r));
+}
+
+Result<std::span<const ProxyHeader>>
+ReverseProxy::request_headers(std::span<const ProxyHeader> input,
+                              ProxyForwarding forwarding,
+                              std::span<ProxyHeader> output) noexcept {
+  if (forwarding.client_address.empty() ||
+      forwarding.client_address.find_first_of(" ,\t") !=
+          std::string_view::npos ||
+      !valid_header_value(forwarding.client_address) ||
+      !valid_header_value(forwarding.original_host)) {
+    return unexpected_error(Errc::InvalidArgument);
+  }
+  const auto filtered = filter_headers(input, output, true);
+  if (!filtered) {
+    return std::unexpected(filtered.error());
+  }
+  auto used = *filtered;
+  const bool has_host = !forwarding.original_host.empty();
+  if (output.size() - used < (has_host ? 3u : 2u)) {
+    return unexpected_error(Errc::TooLarge);
+  }
+  output[used++] = {"X-Forwarded-For", forwarding.client_address};
+  if (has_host) {
+    output[used++] = {"X-Forwarded-Host", forwarding.original_host};
+  }
+  output[used++] = {"X-Forwarded-Proto", forwarding.tls ? "https" : "http"};
+  return output.first(used);
+}
+
+Result<std::span<const ProxyHeader>>
+ReverseProxy::on_response_head(Exchange &ex, ApplyCursor &cur,
+                               ResponseMeta meta,
+                               std::span<const ProxyHeader> input,
+                               std::span<ProxyHeader> output) noexcept {
+  if (cur.head_done || ex.phase() != Phase::Active ||
+      ex.responder_state() != Exchange::ResponderState::Attached) {
+    return unexpected_error(Errc::Canceled);
+  }
+  if (ex.stream(StreamId::Res).state() == StreamState::Aborted) {
+    ex.detach(Side::Responder, Errc::Canceled);
+    return unexpected_error(Errc::Canceled);
+  }
+  const auto filtered = filter_headers(input, output, false);
+  if (!filtered || meta.status < 200 || meta.status > 599) {
+    const Errc why = filtered ? Errc::ProtocolViolation : filtered.error().code;
+    (void)on_failure(ex, why, ProxyRetry::Disallow);
+    return unexpected_error(why);
+  }
+  meta.synthesized = false;
+  if (ex.publish_final(meta) != HeadStatus::Ok) {
+    return unexpected_error(Errc::Canceled);
+  }
+  cur.head_done = true;
+  if (meta.declared_known && meta.declared == 0 &&
+      ex.stream(StreamId::Res).state() == StreamState::Open) {
+    (void)ex.finish(StreamId::Res);
+  }
+  request_staged_ = 0;
+  if (!ex.stream(StreamId::Req).end_seen()) {
+    (void)ex.cancel_request_body();
+  }
+  return output.first(*filtered);
 }
 
 } // namespace Coring5

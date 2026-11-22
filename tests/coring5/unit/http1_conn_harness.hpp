@@ -20,6 +20,7 @@
 #include "coring5/mem/ChunkPool.hpp"
 #include "coring5/obs/Metrics.hpp"
 #include "coring5/proto/http1conn/Http1Conn.hpp"
+#include "coring5/runtime/ExchangeDelivery.hpp"
 #include <cerrno>
 #include <cstdint>
 #include <gtest/gtest.h>
@@ -226,20 +227,18 @@ struct ConnHarness {
     }
   }
 
-  // Deliver every ready exchange to the connection (as
-  // Worker::drain_exchanges). After reap there is no connection: detach the
-  // ingress so the pool can reap the exchange (E11).
-  void drain_exchanges() {
-    for (int i = 0; i < 16 && exchanges_->has_ready(); ++i) {
+  // Deliver ready exchanges as Worker::drain_exchanges does.
+  void drain_exchanges(int passes = 16) {
+    for (int i = 0; i < passes && exchanges_->has_ready(); ++i) {
       exchanges_->drain(64, [this](Handle, Exchange &ex) {
-        if (reaped_) {
-          // The session's release() already detached the ingress; just let the
-          // pool reap it (calling detach again would re-list it forever).
-        } else if (!conn_->core.closing() || conn_->core.inflight() == 0) {
+        deliver_exchange_ingress(ex, [this](ConnRef ingress) {
+          if (!conn_ || ingress.pool != PoolId::Http1 ||
+              ingress.handle != conn_->core.handle()) {
+            return false;
+          }
           conn_->on_exchange(*ctx_);
-        } else if (!ex.ingress_detached()) {
-          ex.detach(Side::Ingress, Errc::Shutdown);
-        }
+          return true;
+        });
       });
     }
     reconcile();

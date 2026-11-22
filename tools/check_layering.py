@@ -40,7 +40,7 @@ ALLOWED = {
     "proto/http3": {"base", "io", "config", "obs", "mem"},
     "upstream": {"base", "config"},
     "tls": {"base"},
-    "handlers": {"base", "proto/http1", "upstream"},
+    "handlers": {"base", "http", "io", "proto/http1", "upstream"},
     "control": set(),
     "runtime": {
         "base",

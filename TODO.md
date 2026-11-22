@@ -84,13 +84,16 @@ Side items: M1 `FakeRing` + randomized lifecycle tests; M2 event-driven `Control
     - [x] `Ring::submit_nowait()`, `io/Cqe.hpp`, `io/RingSeam.hpp`, `io/FakeRing.hpp` (`CORING5_FAKE_RING`)
     - [x] `Http1Conn` on ServerSession (still synthetic 501 until handlers), `ConnPool/ConnPools::on_exchange`
     - [x] Worker: `exchanges_`, `stage_`, `drain_exchanges()` before `reap_closed()`, nowait submit when `has_ready()`, shutdown needs `live()==0`
+    - [x] Stale ingress delivery detaches once and lets the pool reap on the next pass; shared Worker/FakeRing check and deterministic two-pass regression
     - [x] FakeRing lifecycle test (close at every state); INVARIANTS checklist walk-through
           (`tests/coring5/unit/http1_conn_fake_test.cpp` + `http1_conn_harness.hpp`: seeded 1000 seeds x <=12 steps,
           close trigger from every state, short sends, late/stale CQEs, timer/drain/EOF/error; end state
           live()==0, inflight==0, stale_events==0, pools full, no leaked fds)
 - [x] Handlers: Respond / Redirect (`http/Handlers.{hpp,cpp}`; `tests/coring5/unit/handlers_test.cpp`, target `coring5_unit_handlers`; cold-path validation + apply() state machine, 32 tests)
-- [ ] Handlers: StaticFile (statx cache, Range, ETag, path-escape tests)
-- [ ] Handlers: ReverseProxy (hop-by-hop strip, X-Forwarded-*, retries idempotent only)
+- [x] Handlers: StaticFile (`http/StaticFile.cpp`, `handlers/StaticFileRoot.{hpp,cpp}`; pinned-root lookup, per-open statx metadata, single byte ranges, weak ETag, HEAD, credit-based reads; `coring5_unit_static_file`)
+- [x] Handlers: ReverseProxy (`http/Handlers.hpp`, `http/ReverseProxy.cpp`, `coring5_unit_reverse_proxy`)
+  - Strips hop-by-hop fields in both directions, regenerates `X-Forwarded-*` from ingress metadata, and permits bounded retries only for idempotent requests before any upstream bytes have been written.
+  - Streams through Exchange credit and cancellation. The upstream HTTP adapter owns dialing, framing, I/O buffers, and deadlines.
 - [ ] Router integration into ConfigSnapshot
 - [ ] M1: `FakeRing` (io/FakeRing.hpp + RingSeam done; [x] seeded lifecycle tests, Worker not yet templated on the seam)
 - [ ] M2: event-driven `ControlServer`; access-log SPSC writer

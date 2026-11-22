@@ -1,4 +1,5 @@
 #include "coring5/runtime/Worker.hpp"
+#include "coring5/runtime/ExchangeDelivery.hpp"
 
 #include <cerrno>
 #include <csignal>
@@ -447,10 +448,9 @@ void Worker::drain_exchanges() {
   // has_ready() true and the next submit does not block.
   constexpr uint32_t kBudget = 1024;
   exchanges_->drain(kBudget, [this](Handle, Exchange &ex) {
-    if (!connections_->on_exchange(*ctx_, ex.ingress().conn)) {
-      // Ingress connection is gone (normal for peer links): let E11 reap it.
-      ex.detach(Side::Ingress, Errc::Shutdown);
-    }
+    deliver_exchange_ingress(ex, [this](ConnRef ingress) {
+      return connections_->on_exchange(*ctx_, ingress);
+    });
   });
 }
 

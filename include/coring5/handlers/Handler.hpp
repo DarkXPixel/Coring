@@ -31,11 +31,9 @@ enum class HandlerKind : uint8_t {
 //
 //   Respond      - canned status/body (also used for
 //   400/404/413/431/502/503/504) Redirect     - 301/302/307/308 with Location
-//   StaticFile   - fd+statx cache, splice(file->pipe->socket) or read+send,
-//                  Range, If-Modified-Since/ETag; path escape tests are
-//                  mandatory
-//   ReverseProxy - UpstreamPool pick, hop-by-hop strip, X-Forwarded-*, chunked,
-//                  Upgrade/WebSocket, retries only if idempotent AND no byte
-//                  sent
+//   StaticFile   - see handlers/StaticFileRoot.hpp and http/Handlers.hpp;
+//                  the future I/O driver owns queued reads and cancellation
+//   ReverseProxy - see http/Handlers.hpp for the sans-IO handler. The egress
+//                  adapter drives upstream selection, framing and I/O.
 
 } // namespace Coring5

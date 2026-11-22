@@ -434,13 +434,13 @@ TEST(Exchange, E10DetachIsIdempotent) {
   Exchange &e = f.at(h);
   ASSERT_TRUE(e.attach_responder(side(1)));
   e.detach(Side::Ingress, Errc::Reset);
-  const uint16_t after_first = e.pending_events(Side::Ingress);
+  EXPECT_NE(e.take_events(Side::Ingress) & ExEvent::kPeerDetached, 0);
   e.detach(Side::Ingress, Errc::Timeout); // second reason is ignored
   EXPECT_EQ(e.stream(StreamId::Req).aborted_with(), Errc::Reset);
   // PeerDetached is raised again (harmless level hint), but the state is
   // stable.
   EXPECT_EQ(e.phase(), Phase::Closing);
-  EXPECT_NE(after_first & ExEvent::kPeerDetached, 0);
+  EXPECT_NE(e.pending_events(Side::Ingress) & ExEvent::kPeerDetached, 0);
 }
 
 // ------------------------------------------------------------------ aborts

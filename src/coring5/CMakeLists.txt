@@ -51,7 +51,9 @@ coring5_module(obs SOURCES obs/Metrics.cpp DEPS base)
 # Sans-IO HTTP building blocks (BodyStream, Exchange, ExchangePool).
 # Deliberately NO dependency on io: testable and fuzzable without a kernel ring.
 coring5_module(http SOURCES http/BodyStream.cpp http/Exchange.cpp
-                    http/ExchangePool.cpp http/Handlers.cpp DEPS base mem config)
+                    http/ExchangePool.cpp http/Handlers.cpp http/StaticFile.cpp
+                    http/ReverseProxy.cpp
+                    DEPS base mem config)
 
 # ---- io_uring layer ------------------------------------------------------------
 coring5_module(io
@@ -75,7 +77,8 @@ coring5_module(proto_http2 SOURCES proto/http2/Http2Conn.cpp DEPS io)
 coring5_module(proto_http3 SOURCES proto/http3/Http3Conn.cpp DEPS io)
 
 coring5_module(tls)         # interface-only until M5
-coring5_module(handlers DEPS proto_http1 upstream)   # interface-only until M4
+coring5_module(handlers SOURCES handlers/StaticFileRoot.cpp
+                    DEPS http io proto_http1 upstream)
 
 # ---- runtime + control --------------------------------------------------------
 coring5_module(control SOURCES control/ControlServer.cpp SYSTEM_DEPS Threads::Threads)

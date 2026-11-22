@@ -35,6 +35,10 @@ coring5_add_test(coring5_unit_chunked SOURCES unit/chunked_decoder_test.cpp LIBS
 coring5_add_test(coring5_unit_smuggling SOURCES unit/smuggling_corpus_test.cpp LIBS coring5_http coring5_proto_http1)
 coring5_add_test(coring5_unit_response_writer SOURCES unit/response_writer_test.cpp LIBS coring5_proto_http1)
 coring5_add_test(coring5_unit_handlers SOURCES unit/handlers_test.cpp LIBS coring5_http)
+coring5_add_test(coring5_unit_reverse_proxy SOURCES unit/reverse_proxy_test.cpp LIBS coring5_http)
+coring5_enable_warnings(coring5_unit_reverse_proxy)
+coring5_add_test(coring5_unit_static_file SOURCES unit/static_file_test.cpp LIBS coring5_handlers)
+coring5_enable_warnings(coring5_unit_static_file)
 coring5_add_test(coring5_unit_server_session SOURCES unit/server_session_test.cpp LIBS coring5_proto_http1session coring5_http coring5_proto_http1)
 
 # S2 Http1Conn lifecycle tests: compile the connection type with the fake ring
