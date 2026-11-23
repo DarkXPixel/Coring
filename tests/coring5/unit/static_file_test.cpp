@@ -75,8 +75,7 @@ TEST_F(StaticFileRootTest, RejectsPathsThatCouldEscapeTheRoot) {
                                           "/secret%00",
                                           "/bad%",
                                           "/bad%GG",
-                                          "/dir/some%20file.txt#fragment",
-                                          "/"}) {
+                                          "/dir/some%20file.txt#fragment"}) {
         SCOPED_TRACE(target);
         const auto file = root->resolve(target);
         ASSERT_FALSE(file);
@@ -101,6 +100,61 @@ TEST_F(StaticFileRootTest, RejectsSymlinksAndNonRegularFiles) {
     }
     EXPECT_FALSE(StaticFileRoot::open((temp_ / "secret").native()));
     EXPECT_FALSE(root->resolve("/missing"));
+}
+
+TEST_F(StaticFileRootTest, ResolvesDefaultIndexesForRootAndDirectories) {
+    write(root_ / "index.html", "root");
+    write(root_ / "dir" / "index.html", "nested");
+    ASSERT_TRUE(std::filesystem::create_directories(root_ / "no-index" / "index.html"));
+    write(root_ / "no-index" / "index.html" / "index.html", "no recursive index");
+    const auto root = StaticFileRoot::open(root_.native());
+    ASSERT_TRUE(root);
+    for (const auto& [target, size] : {
+             std::pair{"/?v=1", 4u}, {"/dir", 6u}, {"/dir/", 6u}}) {
+        SCOPED_TRACE(target);
+        const auto file = root->resolve(target);
+        ASSERT_TRUE(file);
+        EXPECT_EQ(file->metadata.size, size);
+    }
+    const auto no_index = root->resolve("/no-index/");
+    ASSERT_FALSE(no_index);
+    EXPECT_EQ(no_index.error().sys, EISDIR);
+}
+
+TEST_F(StaticFileRootTest, TriesFilesInOrderAndUsesSelectedFileMetadata) {
+    write(root_ / "dir" / "home.html", "directory index");
+    write(root_ / "spa.html", "spa");
+    const auto root = StaticFileRoot::open(root_.native());
+    ASSERT_TRUE(root);
+    const StaticFileOptions options{
+        .index = "home.html", .try_files = {"$uri", "$uri/", "/spa.html"}};
+    for (const auto& [target, size] : {
+             std::pair{"/dir/some%20file.txt?x=1", 6u},
+             {"/dir", 15u}, {"/dir/", 15u}, {"/client/route", 3u}}) {
+        SCOPED_TRACE(target);
+        const auto file = root->resolve(target, &options);
+        ASSERT_TRUE(file);
+        EXPECT_EQ(file->metadata.size, size);
+    }
+    std::filesystem::remove(root_ / "spa.html");
+    const auto missing = root->resolve("/client/route", &options);
+    ASSERT_FALSE(missing);
+    EXPECT_EQ(missing.error().sys, ENOENT);
+}
+
+TEST_F(StaticFileRootTest, FallbackCannotHidePathRejectionOrSymlinkEscape) {
+    write(root_ / "spa.html", "spa");
+    std::filesystem::create_symlink(temp_ / "secret", root_ / "dir" / "index.html");
+    std::filesystem::create_directory_symlink(temp_, root_ / "outside");
+    const auto root = StaticFileRoot::open(root_.native());
+    ASSERT_TRUE(root);
+    const StaticFileOptions options{.try_files = {"$uri", "$uri/", "/spa.html"}};
+    for (const auto target : {"/outside", "/outside/", "/dir/", "/%2e%2e/secret"}) {
+        SCOPED_TRACE(target);
+        const auto file = root->resolve(target, &options);
+        ASSERT_FALSE(file);
+        EXPECT_EQ(file.error().code, Errc::ProtocolViolation);
+    }
 }
 
 TEST_F(StaticFileRootTest, KeepsRootPinnedAndRefreshesMetadataOnEachOpen) {

@@ -1,5 +1,4 @@
 #include "coring5/proto/http1conn/Responders.hpp"
-#include <cstring>
 #include <fcntl.h>
 
 namespace Coring5 {
@@ -12,6 +11,8 @@ uint16_t file_status(int error) {
   case ELOOP:
   case EXDEV:
     return 404;
+  case EISDIR:
+    return 403;
   case ENAMETOOLONG:
     return 414;
   case EMFILE:
@@ -48,7 +49,8 @@ void FileResponder::start(IoContext &ctx, ConnCore &core, Exchange &ex,
     return;
   }
   // Preserve conditional fields across asynchronous lookup and config reload.
-  auto tail = buf.subspan(std::strlen(buf.data()) + 1);
+  const std::string_view uri(buf.data());
+  auto tail = buf.subspan(uri.size() + 1);
   // Values plus separators fit in the stage: their original wire form also
   // contained the field names, colons and CRLFs.
   auto save_list =
@@ -77,43 +79,74 @@ void FileResponder::start(IoContext &ctx, ConnCore &core, Exchange &ex,
   conditions_.range = save_list("range");
   conditions_.has_if_range = head.find("if-range").data() != nullptr;
 
-  // The control thread can retire this root immediately after reload. A unique
-  // dirfd also prevents a cancellation from affecting another request.
-  core.set_peer(FdOwner(::fcntl(root->second.fd(), F_DUPFD_CLOEXEC, 0)));
-  if (!core.has_peer()) {
+  // Keep the pinned root open across reload and all candidate probes.
+  directory_.reset(::fcntl(root->second.fd(), F_DUPFD_CLOEXEC, 0));
+  if (!directory_) {
     (void)ex.respond_synthetic(503);
     return;
   }
-  if (!core.counted_file_lookup(ctx.ring.open_file(core.peer_fd(), buf.data(),
-                                                   &how_,
-                                                   core.tag(OpKind::FileOpen)),
-                                OpKind::FileOpen)) {
+  options_ = route.options;
+  lookup_.emplace(uri, options_.get());
+  open_next(ctx, core, ex);
+}
+
+void FileResponder::open_next(IoContext &ctx, ConnCore &core, Exchange &ex) {
+  const auto path = lookup_->next();
+  if (!path) {
+    fail_lookup(core, ex, file_status(path.error().sys));
+    return;
+  }
+  core.reset_peer();
+  if (!core.counted_file_lookup(
+          ctx.ring.open_file(directory_.get(), *path, &how_,
+                             core.tag(OpKind::FileOpen)),
+          OpKind::FileOpen)) {
     core.close(ctx, Errc::Overloaded);
   }
+}
+
+void FileResponder::fail_lookup(ConnCore &core, Exchange &ex, uint16_t status) {
+  directory_.reset();
+  core.reset_peer();
+  (void)ex.respond_synthetic(status);
 }
 
 void FileResponder::complete(IoContext &ctx, ConnCore &core, Exchange &ex,
                              const Cqe &cqe) {
   if (cqe.tag.kind() == OpKind::FileOpen) {
-    core.set_peer(FdOwner(cqe.res));
     if (cqe.res < 0) {
-      (void)ex.respond_synthetic(file_status(-cqe.res));
-    } else if (!core.counted_file_lookup(
-                   ctx.ring.stat_file(core.peer_fd(),
-                                      StaticFileRoot::stat_fields, &stat_,
-                                      core.tag(OpKind::FileStat)),
-                   OpKind::FileStat)) {
+      if (StaticFileLookup::is_miss(-cqe.res)) {
+        open_next(ctx, core, ex);
+      } else {
+        fail_lookup(core, ex, file_status(-cqe.res));
+      }
+      return;
+    }
+    core.set_peer(FdOwner(cqe.res));
+    stat_ = {};
+    if (!core.counted_file_lookup(
+            ctx.ring.stat_file(core.peer_fd(), StaticFileRoot::stat_fields,
+                               &stat_, core.tag(OpKind::FileStat)),
+            OpKind::FileStat)) {
       core.close(ctx, Errc::Overloaded);
     }
   } else if (cqe.tag.kind() == OpKind::FileStat) {
-    const auto meta = StaticFileRoot::metadata(stat_);
-    if (cqe.res < 0 || !meta) {
-      core.reset_peer();
-      (void)ex.respond_synthetic(cqe.res < 0 ? file_status(-cqe.res) : 404);
+    if (cqe.res < 0) {
+      fail_lookup(core, ex, file_status(-cqe.res));
       return;
     }
+    const auto meta = lookup_->inspect(stat_);
+    if (!meta) {
+      fail_lookup(core, ex, 404);
+      return;
+    }
+    if (!*meta) {
+      open_next(ctx, core, ex);
+      return;
+    }
+    directory_.reset();
     file_ =
-        StaticFile::prepare(*meta, ex.request_meta().head_only, conditions_);
+        StaticFile::prepare(**meta, ex.request_meta().head_only, conditions_);
     fields_ = {{{"Last-Modified", file_->last_modified()},
                 {"ETag", file_->etag()},
                 {"Accept-Ranges", file_->accept_ranges()},

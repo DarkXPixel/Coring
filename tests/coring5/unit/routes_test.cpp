@@ -123,6 +123,7 @@ location = [
   auto file = s->match(kWeb, "", "/s", scratch);
   ASSERT_NE(file.action, nullptr);
   EXPECT_EQ(std::get<StaticRoute>(*file.action).root, "/srv/site");
+  EXPECT_EQ(std::get<StaticRoute>(*file.action).file_options().index, "index.html");
   auto redirect = s->match(kWeb, "", "/r", scratch);
   ASSERT_NE(redirect.action, nullptr);
   EXPECT_EQ(std::get<RedirectRoute>(*redirect.action),
@@ -135,6 +136,57 @@ TEST(Routes, UnboundListenerHasNoMatch) {
       "[[listener]]\nname='web'\nprotocol='http1'\naddress=':0'\nroute=''\n");
   ASSERT_TRUE(s) << s.error();
   EXPECT_TRUE(body(*s, "example.com", "/").empty());
+}
+
+TEST(Routes, ParsesStaticLookupPolicyAndDiffsChangesByValue) {
+  const auto make = [](std::string_view index, std::string_view order) {
+    return snapshot(with_listener(single(
+        "path='/', action='static_file', root='/srv/site', index='" +
+        std::string(index) + "', try_files=" + std::string(order))));
+  };
+  constexpr auto order = "['$uri', '$uri/', '/index.html']";
+  const auto current = make("home.html", order);
+  const auto same = make("home.html", order);
+  const auto different_index = make("index.html", order);
+  const auto different_order = make("home.html", "['$uri/', '$uri', '/index.html']");
+  ASSERT_TRUE(current) << current.error();
+  ASSERT_TRUE(same) << same.error();
+  ASSERT_TRUE(different_index) << different_index.error();
+  ASSERT_TRUE(different_order) << different_order.error();
+  std::array<char, 32> scratch;
+  const auto match = current->match(kWeb, "", "/page", scratch);
+  ASSERT_NE(match.action, nullptr);
+  const auto &policy = std::get<StaticRoute>(*match.action).file_options();
+  EXPECT_EQ(policy.index, "home.html");
+  EXPECT_EQ(policy.try_files, (std::vector<std::string>{"$uri", "$uri/", "/index.html"}));
+  EXPECT_TRUE(diff_snapshots(*current, *same).empty());
+  for (const auto *next : {&*different_index, &*different_order}) {
+    const auto diff = diff_snapshots(*current, *next);
+    EXPECT_TRUE(diff.routes_changed);
+    EXPECT_EQ(diff.kept, std::vector<ListenerId>{kWeb});
+    EXPECT_TRUE(diff.added.empty());
+    EXPECT_TRUE(diff.removed.empty());
+  }
+}
+
+TEST(Routes, RejectsInvalidStaticLookupPolicy) {
+  for (const std::string_view field : {
+           "index=''", "index=10", "index='../home.html'", "index='dir/home.html'",
+           "index='%2e%2e'", "index='..'", "try_files='$uri'", "try_files=[]",
+           "try_files=[3]", "try_files=['']", "try_files=['$document_root']",
+           "try_files=['relative.html']", "try_files=['//file']",
+           "try_files=['/a//file']", "try_files=['/a/../file']",
+           "try_files=['/a/%2e%2e/file']", "try_files=['/a?query']",
+           "try_files=['/a\\b']", "try_files=['/a#fragment']",
+           "try_files=['/1','/2','/3','/4','/5','/6','/7','/8','/9']"}) {
+    SCOPED_TRACE(field);
+    const auto result = snapshot(single(
+        std::string("path='/', action='static_file', root='/srv/site', ")
+            .append(field)));
+    ASSERT_FALSE(result);
+    EXPECT_NE(result.error().find(field.starts_with("index") ? "index" : "try_files"),
+              std::string::npos) << result.error();
+  }
 }
 
 TEST(Routes, RejectsInvalidTablesBindingsAndActions) {

@@ -19,9 +19,13 @@ ConfigSnapshot routes() {
   listener.route = "site";
   auto &site = config.routes["site"];
   site.hosts.emplace("", 0);
-  site.vhosts.emplace_back().exact = {
+  auto &host = site.vhosts.emplace_back();
+  host.exact = {
       {"/file", StaticRoute{"/files"}},
       {"/proxy", ProxyRoute{"origin", UpstreamId{1}}}};
+  host.prefix.emplace("/app", StaticRoute{
+      "/files", std::make_shared<const StaticFileOptions>(StaticFileOptions{
+          .index = "home.html", .try_files = {"$uri", "$uri/", "/spa.html"}})});
   auto &up = config.upstreams.emplace_back();
   up.id = UpstreamId{1};
   up.backends.push_back(*Endpoint::parse("127.0.0.1:8000"));
@@ -131,14 +135,20 @@ protected:
       bytes.remove_prefix(part.size());
     }
   }
-  void opened(uint64_t size) {
+  Op file_open(std::string_view path) {
     auto open = operation(OpKind::FileOpen);
-    EXPECT_STREQ(static_cast<const char *>(open.buf), "file");
-    done(open, ::open("/dev/null", O_RDONLY | O_CLOEXEC));
+    EXPECT_EQ(std::string_view(static_cast<const char *>(open.buf)), path);
+    return open;
+  }
+  void opened(uint64_t size, std::string_view path = "file", unsigned type = S_IFREG) {
+    const int fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    done(file_open(path), fd);
     auto stat = operation(OpKind::FileStat);
+    EXPECT_EQ(stat.fd, fd);
     auto *out = static_cast<struct statx *>(const_cast<void *>(stat.buf));
     out->stx_mask = StaticFileRoot::stat_fields;
-    out->stx_mode = S_IFREG | 0444;
+    out->stx_mode = static_cast<uint16_t>(type | 0444);
     out->stx_size = size;
     done(stat, 0);
   }
@@ -174,6 +184,82 @@ TEST_F(AdapterIo, FileOpenWinningCloseRaceReleasesReturnedFd) {
   harness->c().core.close(harness->ctx(), Errc::Shutdown);
   harness->reconcile();
   auto late = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
+  ASSERT_GE(late, 0);
+  done(op, late);
+  EXPECT_EQ(::fcntl(late, F_GETFD), -1);
+  EXPECT_EQ(errno, EBADF);
+}
+
+TEST_F(AdapterIo, StaticFallbackKeepsLookupPolicyAcrossReload) {
+  request(req("HEAD", "/app/client?q=1", "If-None-Match: *\r\n"));
+  const auto first = file_open("app/client");
+  auto next = routes();
+  auto &route = std::get<StaticRoute>(next.routes.at("site").vhosts.front().prefix.at("/app"));
+  route.options = std::make_shared<const StaticFileOptions>(StaticFileOptions{
+      .index = "updated.html", .try_files = {"$uri/", "/updated.html"}});
+  config = std::move(next);
+  roots.directories.clear();
+  auto root = StaticFileRoot::open("/tmp");
+  ASSERT_TRUE(root);
+  roots.directories.emplace("/files", std::move(*root));
+
+  done(first, -ENOENT);
+  const auto directory = file_open("app/client/home.html");
+  EXPECT_EQ(directory.fd, first.fd);
+  EXPECT_GE(::fcntl(directory.fd, F_GETFD), 0);
+  done(directory, -ENOENT);
+  EXPECT_EQ(file_open("spa.html").fd, first.fd);
+  opened(10, "spa.html");
+  EXPECT_TRUE(sent().starts_with("HTTP/1.1 304"));
+  EXPECT_FALSE(pending(OpKind::Read));
+
+  request(req("HEAD", "/app/client"));
+  done(file_open("app/client/updated.html"), -ENOENT);
+  opened(16, "updated.html");
+  const auto wire = sent();
+  EXPECT_TRUE(wire.starts_with("HTTP/1.1 200"));
+  EXPECT_TRUE(wire.ends_with("Content-Length: 16\r\n\r\n"));
+  EXPECT_FALSE(pending(OpKind::Read));
+}
+
+TEST_F(AdapterIo, StaticDirectoryWithoutIndexReturnsForbidden) {
+  request(req("GET", "/file"));
+  opened(0, "file", S_IFDIR);
+  done(file_open("file/index.html"), -ENOENT);
+  EXPECT_TRUE(sent().starts_with("HTTP/1.1 403"));
+  EXPECT_FALSE(pending(OpKind::FileOpen));
+}
+
+TEST_F(AdapterIo, StaticFallbackRangeUsesFinalFileSize) {
+  request(req("GET", "/app/client", "Range: bytes=2-4\r\n"));
+  done(file_open("app/client"), -ENOENT);
+  done(file_open("app/client/home.html"), -ENOENT);
+  opened(8, "spa.html");
+  const auto read = operation(OpKind::Read);
+  EXPECT_EQ(read.offset, 2u);
+  ASSERT_EQ(read.len, 3u);
+  std::memcpy(const_cast<void *>(read.buf), "spa", 3);
+  done(read, 3);
+  const auto wire = sent();
+  EXPECT_TRUE(wire.starts_with("HTTP/1.1 206"));
+  EXPECT_TRUE(wire.contains("Content-Range: bytes 2-4/8\r\n"));
+  EXPECT_TRUE(wire.ends_with("\r\n\r\nspa"));
+}
+
+TEST_F(AdapterIo, StaticFallbackDoesNotRetrySymlinkFailure) {
+  request(req("GET", "/app/linked"));
+  done(file_open("app/linked"), -ELOOP);
+  EXPECT_TRUE(sent().starts_with("HTTP/1.1 404"));
+  EXPECT_FALSE(pending(OpKind::FileOpen));
+}
+
+TEST_F(AdapterIo, StaticFallbackOpenWinningCloseRaceReleasesReturnedFd) {
+  request(req("GET", "/app/missing"));
+  done(file_open("app/missing"), -ENOENT);
+  const auto op = file_open("app/missing/home.html");
+  harness->c().core.close(harness->ctx(), Errc::Shutdown);
+  harness->reconcile();
+  const int late = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
   ASSERT_GE(late, 0);
   done(op, late);
   EXPECT_EQ(::fcntl(late, F_GETFD), -1);

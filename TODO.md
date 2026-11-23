@@ -115,6 +115,7 @@ This is the current implementation and acceptance record for M0–M4 of the road
   - [x] Serialize handler fields including `Location` with session-owned framing. Deterministic tests cover pipelining, HEAD, empty responses, reload during streaming, and teardown with no live exchanges, inflight operations, or stale events.
 - [x] HTTP/1 dispatch for `StaticFile` and `ReverseProxy` through counted ring operations.
   - [x] Pin roots on the control thread. Open beneath the selected root, stat the opened fd, and read ranges against response credit. HEAD and 304 complete without a body read.
+  - [x] Serve directory indexes with `index = "index.html"` by default. Configure SPA fallback with `try_files = ["$uri", "$uri/", "/index.html"]`. Ordered probes stay beneath the pinned root and use fresh metadata for the selected file. [Configuration syntax](CORING5_GUIDE.md#directory-indexes-and-spa-fallback)
   - [x] Prepare backend tables before worker apply. Dial within one connect budget, regenerate HTTP/1 framing and forwarding fields, and stream uploads and responses with independent peer I/O deadlines. An active exchange owns its upstream connection. The worker can park a reusable connection after the exchange.
   - [x] Deterministic completion-order, backpressure, timeout, reload and fd/pool cleanup tests in `http1_adapters_test.cpp`. Real-ring proxy-to-file delivery, validators, ranges and failed reload in `http1_handlers_test.cpp`.
 - [x] M1: Worker uses the compile-time ring seam in production and FakeRing builds.
@@ -129,6 +130,7 @@ This is the current implementation and acceptance record for M0–M4 of the road
 
 ## Bounded closeout verification
 
+- [x] Static-file index and fallback passed an out-of-tree GCC 16.2.1 Debug build with warnings as errors, 87 focused unit tests in 0.06 s, and layering (104 files, zero violations). The tests covered lookup ordering, containment, reload, HEAD, validators, ranges and fd cleanup. No selected tests skipped. Real-ring integration, the remaining unit tests, fuzzing and benchmarks were outside this run.
 - [x] Out-of-tree GCC 16.2.1 Debug build with `CORING5_WERROR=ON` and `CMAKE_COMPILE_WARNING_AS_ERROR=ON` passed. LTO was disabled for this build.
 - [x] All 439 existing-suite unit cases passed, including the partial interim send and stale ingress regressions. Layering checked 104 files with zero violations.
 - The closeout used unit tests only. Integration, fuzz and benchmark evidence below comes from earlier runs. Closeout build and test logs are under `/tmp/coring5-m0-m4.dpEkHv/`.

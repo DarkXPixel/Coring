@@ -59,7 +59,10 @@ std::expected<RouteAction, std::string> parse_action(const toml::table &t) {
   if (kind == "static_file" || kind == "reverse_proxy") {
     const bool proxy = kind == "reverse_proxy";
     const auto key = proxy ? "upstream" : "root";
-    if (auto keys = check_keys(t, common, {key}); !keys) {
+    const auto keys =
+        proxy ? check_keys(t, common, {"upstream"})
+              : check_keys(t, common, {"root", "index", "try_files"});
+    if (!keys) {
       return RouteError(keys.error());
     }
     auto value = t[key].value<std::string>();
@@ -69,7 +72,34 @@ std::expected<RouteAction, std::string> parse_action(const toml::table &t) {
     if (proxy) {
       return ProxyRoute{std::move(*value)};
     }
-    return StaticRoute{std::move(*value)};
+    StaticRoute route{std::move(*value)};
+    if (t.contains("index") || t.contains("try_files")) {
+      StaticFileOptions options;
+      auto index = field(t, "index", options.index);
+      if (!index) {
+        return RouteError(index.error());
+      }
+      options.index = std::move(*index);
+      if (t.contains("try_files")) {
+        const auto *files = t["try_files"].as_array();
+        if (!files || files->empty() ||
+            files->size() > StaticFileOptions::max_candidates) {
+          return RouteError(std::format(
+              "static_file try_files must be an array of 1 to {} strings",
+              StaticFileOptions::max_candidates));
+        }
+        for (const auto &node : *files) {
+          auto file = node.value_exact<std::string>();
+          if (!file) {
+            return RouteError("static_file try_files candidates must be strings");
+          }
+          options.try_files.push_back(std::move(*file));
+        }
+      }
+      route.options =
+          std::make_shared<const StaticFileOptions>(std::move(options));
+    }
+    return route;
   }
   return RouteError(
       "route action must be respond, redirect, static_file or reverse_proxy");
@@ -202,6 +232,57 @@ std::expected<RouteSets, std::string> parse_routes(const toml::table &root) {
 }
 
 namespace {
+bool valid_file_segment(std::string_view segment) {
+  return !segment.empty() && segment != "." && segment != ".." &&
+         std::ranges::all_of(segment, [](unsigned char c) {
+           return c >= 0x20 && c != 0x7f &&
+                  std::string_view("/\\%?#$").find(static_cast<char>(c)) ==
+                      std::string_view::npos;
+         });
+}
+
+bool valid_file_candidate(std::string_view path, std::size_t index_size) {
+  if (path == "$uri" || path == "$uri/") {
+    return true;
+  }
+  if (!path.starts_with('/')) {
+    return false;
+  }
+  const bool directory = path.ends_with('/');
+  path.remove_prefix(1);
+  if (path.size() >= PATH_MAX ||
+      (directory && path.size() + index_size >= PATH_MAX)) {
+    return false;
+  }
+  while (!path.empty()) {
+    const auto slash = path.find('/');
+    const auto segment = path.substr(0, slash);
+    if (segment.size() > NAME_MAX || !valid_file_segment(segment)) {
+      return false;
+    }
+    if (slash == path.npos) {
+      break;
+    }
+    path.remove_prefix(slash + 1);
+  }
+  return true;
+}
+} // namespace
+
+std::string_view StaticFileOptions::validation_error() const noexcept {
+  if (index.size() > NAME_MAX || !valid_file_segment(index)) {
+    return "static_file index must be a single literal filename";
+  }
+  if (try_files.size() > max_candidates ||
+      !std::ranges::all_of(try_files, [&](std::string_view candidate) {
+        return valid_file_candidate(candidate, index.size());
+      })) {
+    return "invalid static_file try_files candidate or list length";
+  }
+  return {};
+}
+
+namespace {
 std::expected<void, std::string> validate_action(const RouteAction &action,
                                                  const ParsedConfig &cfg) {
   if (auto r = std::get_if<RespondRoute>(&action)) {
@@ -222,6 +303,9 @@ std::expected<void, std::string> validate_action(const RouteAction &action,
     if (f->root.size() >= PATH_MAX || !f->root.starts_with('/') ||
         f->root.find('\0') != f->root.npos) {
       return RouteError("static_file root must be an absolute directory path");
+    }
+    if (const auto error = f->file_options().validation_error(); !error.empty()) {
+      return RouteError(std::string(error));
     }
   } else {
     const auto &proxy = std::get<ProxyRoute>(action);

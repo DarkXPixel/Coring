@@ -44,9 +44,26 @@ struct RedirectRoute {
     return status == other.status && target() == other.target();
   }
 };
+struct StaticFileOptions {
+  static constexpr std::size_t max_candidates = 8;
+  static constexpr std::string_view default_index = "index.html";
+  std::string index{default_index};
+  std::vector<std::string> try_files;
+  bool operator==(const StaticFileOptions &) const = default;
+  [[nodiscard]] std::string_view validation_error() const noexcept;
+};
 struct StaticRoute {
   std::string root;
-  bool operator==(const StaticRoute &) const = default;
+  // An in-flight lookup retains just this immutable policy across reload.
+  std::shared_ptr<const StaticFileOptions> options{};
+
+  [[nodiscard]] const StaticFileOptions &file_options() const noexcept {
+    static const StaticFileOptions defaults;
+    return options ? *options : defaults;
+  }
+  bool operator==(const StaticRoute &other) const noexcept {
+    return root == other.root && file_options() == other.file_options();
+  }
 };
 struct ProxyRoute {
   std::string upstream;

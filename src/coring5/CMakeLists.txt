@@ -71,7 +71,7 @@ coring5_module(proto_l4
   SOURCES proto/l4/EchoConn.cpp proto/l4/L4Conn.cpp
   DEPS io net upstream)
 coring5_module(handlers SOURCES handlers/StaticFileRoot.cpp
-                    DEPS http io proto_http1 upstream)
+                    DEPS config http io proto_http1 upstream)
 # Connection types per protocol (depend on io). proto_http1 stays sans-IO.
 coring5_module(proto_http1conn
   SOURCES proto/http1conn/Http1Conn.cpp proto/http1conn/FileResponder.cpp

@@ -178,10 +178,29 @@ For CPU pinning, run `python3 tools/coring5_cpus.py 4` and copy its output under
 | --- | --- |
 | `respond` | Optional `status` (200–599, default 200) and `body` (default empty, up to 1 MiB). Status 204 and 304 require an empty body. |
 | `redirect` | Required `target` sets the Location header and accepts up to 8192 printable ASCII bytes without spaces. `status` is 301, 302 (default), 303, 307 or 308. |
-| `static_file` | `root` is an absolute directory path. The full request path maps beneath the root, including the location prefix. Coring opens regular files beneath this directory, rejects symlinks, and supports GET, HEAD, a single byte range, weak ETag and Last-Modified validators. It reads metadata from the opened fd on each request. |
+| `static_file` | `root` is an absolute directory path. The full request path maps beneath the root, including the location prefix. Optional `index` and `try_files` select a directory index or fallback file. Coring reads fresh metadata from the selected regular file's fd and supports GET, HEAD, single byte ranges, weak ETag and Last-Modified validators. |
 | `reverse_proxy` | `upstream` names a backend group. The proxy forwards the original target, strips hop-by-hop fields, regenerates forwarding and framing headers, and streams through bounded queues. HTTP/1.1 upstream sockets can be reused after complete uploads and persistent, self-delimited responses. The worker probes cached sockets before reuse. An idempotent request can be retried once on transient failure within the connect budget before any upstream write succeeds. A bodyless HTTP/1.1 GET with `Connection: Upgrade`, a single `Upgrade: websocket`, and no `Expect`, `Content-Length` or `Transfer-Encoding` switches both directions to raw bytes after a matching upstream 101. Other protocol upgrades and CONNECT are unsupported. |
 
 HTTP/1 client pipelining is serial. The server accepts Content-Length and chunked request bodies, validates and drops request trailers, and supports `Expect: 100-continue`. For chunked upstream responses, an HTTP/1.1 client can opt into permitted response trailers with `Connection: TE` and `TE: trailers`. The proxy regenerates these fields for the upstream hop and tracks forwarded, dropped and rejected trailers in stats. An early final response closes the client connection after the response. See [the shipped reverse-proxy example](deploy/coring.example.toml) for a single-route configuration.
+
+### Directory indexes and SPA fallback
+
+`index` defaults to `"index.html"` and accepts one literal filename. With `try_files` omitted, a directory request such as `/`, `/docs` or `/docs/` serves that directory's index. A missing file returns 404. An existing directory without a usable index returns 403.
+
+```toml
+[[route_set.vhost.location]]
+path = "/"
+action = "static_file"
+root = "/srv/app/dist"
+index = "index.html"
+try_files = ["$uri", "$uri/", "/index.html"]
+```
+
+`try_files` accepts one to eight strings in lookup order. `$uri` probes for a regular file at the decoded request path, without the query. `$uri/` probes for the index in that directory. Literal candidates start with `/` and are relative to the pinned root. A literal ending in `/` probes for its directory's index. Use literal names without URL escapes, query strings, fragments or dot segments. In the example, an existing asset or directory index wins. A missing client-side route falls through to `/index.html` within the same route. If all candidates miss, the response is 404.
+
+Every candidate stays beneath the pinned root. Lookup rejects symlinks and mount crossings and stops on containment failures. Reload applies the new lookup policy to subsequent requests. A lookup already in progress uses the root and policy it started with.
+
+Focused filesystem, configuration and FakeRing tests cover this lookup path. [Verification record](TODO.md#bounded-closeout-verification)
 
 ## Reload, access logs and shutdown
 

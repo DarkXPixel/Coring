@@ -40,7 +40,13 @@ public:
   void complete(IoContext &, ConnCore &, Exchange &, const Cqe &);
 
 private:
+  void open_next(IoContext &, ConnCore &, Exchange &);
+  void fail_lookup(ConnCore &, Exchange &, uint16_t status);
+
   ResponderBuffer buffer_;
+  FdOwner directory_;
+  std::shared_ptr<const StaticFileOptions> options_;
+  std::optional<StaticFileLookup> lookup_;
   open_how how_ = StaticFileRoot::open_options();
   struct statx stat_{};
   StaticFileConditions conditions_{};
