@@ -109,10 +109,31 @@ connection_token(bool keep, uint8_t minor) noexcept {
 inline constexpr std::string_view kContinue100 =
     "HTTP/1.1 100 Continue\r\n\r\n";
 
+struct RequestOutcome {
+  uint64_t bytes_in{0};  // parsed head plus consumed wire body bytes
+  uint64_t bytes_out{0}; // successful send completions delivered to the session
+  uint16_t status{0};    // serialized final status, or 0 if none was built
+};
+
+// on_head routes an opened Exchange. on_parsed also sees heads that are
+// rejected before an Exchange opens. Both borrow the input of this call.
+// on_begin/on_complete bracket each request attempt, including a partial
+// head abandoned at teardown. Pipelined attempts are observed serially.
+struct RequestObserver {
+  void *context{};
+  void (*on_head)(void *, const RequestHead &) noexcept {};
+  void (*on_begin)(void *) noexcept {};
+  void (*on_parsed)(void *, const RequestHead &) noexcept {};
+  void (*on_complete)(void *, const RequestOutcome &) noexcept {};
+  void (*on_trailers)(void *, uint32_t forwarded, uint32_t dropped,
+                      bool rejected) noexcept {};
+};
+
 class ServerSession {
 public:
   ServerSession(ExchangePool &exchanges, ChunkPool &stage, const Limits &limits,
-                uint32_t buffer_size, SideRef self) noexcept;
+                uint32_t buffer_size, SideRef self,
+                RequestObserver observer = {}) noexcept;
   ~ServerSession();
   ServerSession(const ServerSession &) = delete;
   ServerSession &operator=(const ServerSession &) = delete;
@@ -165,7 +186,7 @@ public:
   [[nodiscard]] Errc close_reason() const noexcept { return close_why_; }
 
 private:
-  enum class Mode : uint8_t { None, Length, Chunked, CloseDelimited };
+  enum class Mode : uint8_t { None, Length, Chunked, CloseDelimited, Tunnel };
 
   [[nodiscard]] Exchange *cur() const noexcept {
     return ex_.valid() ? pool_->get(ex_) : nullptr;
@@ -202,6 +223,7 @@ private:
 
   void fail_hard(Errc why) noexcept;
   void drop_exchange(Errc why) noexcept;
+  void complete_request() noexcept;
   void refresh() noexcept;
   [[nodiscard]] SessionDeadline compute_kind() const noexcept;
 
@@ -211,6 +233,9 @@ private:
   uint32_t buffer_size_;
   uint32_t cap_;
   SideRef self_;
+  RequestObserver observer_;
+  RequestOutcome outcome_{};
+  bool observing_request_{false};
 
   Handle ex_{};
   Handle fresh_{};
@@ -245,7 +270,7 @@ private:
   Errc close_why_{Errc::Eof};
   bool peer_eof_{false};
   bool progress_{false};
-  bool payload_out_{false}; // a payload send borrows front(Res)
+  bool payload_out_{false}; // a staged payload send awaits its CQE
   DeadlineSpec dl_{};
 };
 

@@ -1,10 +1,15 @@
 #include "coring5/runtime/Daemon.hpp"
 
+#include <cstring>
 #include <format>
+#include <new>
 
 namespace Coring5 {
 
 std::expected<void, std::string> Daemon::start() {
+  if (workers_.running()) {
+    return std::unexpected("daemon already started");
+  }
   auto parsed = load_config_file(opts_.config_path);
   if (!parsed) {
     return std::unexpected(parsed.error());
@@ -17,13 +22,33 @@ std::expected<void, std::string> Daemon::start() {
   }
   drain_timeout_ = parsed->runtime.drain_timeout;
 
-  if (auto r = workers_.start(parsed->runtime); !r) {
+  access_writer_.reset();
+  std::span<AccessLogRing> access_logs;
+  const auto &log = parsed->access_log;
+  if (!log.path.empty()) {
+    const auto n = parsed->runtime.workers;
+    access_logs_.reset(new (std::nothrow) AccessLogRing[n]);
+    if (!access_logs_) {
+      return std::unexpected("[access_log] could not allocate worker rings");
+    }
+    access_logs = {access_logs_.get(), n};
+    if (auto r = access_writer_.emplace().start(
+            log.path.c_str(), access_logs, {log.rotate_bytes, log.rotate_files});
+        !r) {
+      access_logs_.reset();
+      return std::unexpected(std::format("[access_log] '{}': {}", log.path,
+                                         std::strerror(r.error().sys)));
+    }
+  }
+
+  if (auto r = workers_.start(parsed->runtime, access_logs); !r) {
+    (void)stop();
     return std::unexpected(r.error());
   }
   config_ = std::make_unique<ConfigManager>(workers_);
   auto applied = config_->apply(std::move(*parsed));
   if (!applied) {
-    workers_.shutdown(Millis{1000});
+    (void)stop();
     return std::unexpected(applied.error());
   }
 
@@ -34,7 +59,7 @@ std::expected<void, std::string> Daemon::start() {
                       .status = [this] { return status(); },
                       .shutdown = [this] { request_stop(); }});
   if (auto err = control_->start(); !err.empty()) {
-    workers_.shutdown(Millis{1000});
+    (void)stop();
     return std::unexpected(err);
   }
   return {};
@@ -51,14 +76,19 @@ std::string Daemon::reload() {
            " (running configuration unchanged or partially applied; see "
            "status)";
   }
-  return std::format("OK generation={} listeners_added={} removed={} "
-                     "limits_changed={} upstreams_changed={} acked={}",
-                     r->generation, r->diff.added.size(),
-                     r->diff.removed.size(), r->diff.limits_changed,
-                     r->diff.upstreams_changed, r->workers_acked);
+  return std::format(
+      "OK generation={} listeners_added={} removed={} "
+      "limits_changed={} upstreams_changed={} routes_changed={} acked={}",
+      r->generation, r->diff.added.size(), r->diff.removed.size(),
+      r->diff.limits_changed, r->diff.upstreams_changed, r->diff.routes_changed,
+      r->workers_acked);
 }
 
-std::string Daemon::stats() const { return render_metrics(workers_.metrics()); }
+std::string Daemon::stats() const {
+  return render_metrics(workers_.metrics()) +
+         std::format("coring_access_log_sink_errno {}\n",
+                     access_writer_ ? access_writer_->error() : 0);
+}
 
 std::string Daemon::status() const {
   if (!config_ || !config_->current()) {
@@ -69,11 +99,14 @@ std::string Daemon::status() const {
                      workers_.size(), snap->generation, snap->listeners.size());
 }
 
-void Daemon::stop() {
+Result<> Daemon::stop() {
   if (control_) {
     control_->stop();
   }
   workers_.shutdown(drain_timeout_);
+  auto result = access_writer_ ? access_writer_->stop() : Result<>{};
+  access_logs_.reset();
+  return result;
 }
 
 } // namespace Coring5

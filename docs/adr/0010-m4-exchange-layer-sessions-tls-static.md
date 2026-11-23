@@ -1,19 +1,11 @@
 # ADR 0010 — M4 architecture: protocol-neutral Exchange layer, session lifecycles, sans-IO TLS transport, static files
 
-**Status: PROPOSED (draft).** The only part implemented so far is the M4.0
-`OpTag` bit split (§4.4); everything else is unimplemented. It decides
-*shapes and boundaries* so M4 can start; every item in "Deferred" is
-deliberately left open, including the H1 idle-liveness strategy (§4.1, M4.3).
-The M4.1 detail of §3 (the `Exchange` state machine, `BodyStream` credit and
-wake rules, trailer validation) is specified in
-[EXCHANGE.md](../EXCHANGE.md), which this ADR defers to wherever they differ;
-that spec is also design only. It builds on ADR 0003 (in-flight accounting), 0005
-(sans-IO), 0006 (buffers/leases) and 0009 (L4 only), and does not change
-them. Supersede this ADR rather than editing it once implementation starts.
-
-Claims below are marked **[checked]** when verified in this repository while
-writing the draft, and **[assumed]** when they rest on design reasoning or
-outside knowledge and must be validated by the first implementation.
+**Status: Accepted (2026-11-23).** This decision records the implemented M4
+HTTP/1 design and the boundaries for later protocol adapters. The M4 choices
+below govern where the earlier [Exchange specification](../EXCHANGE.md)
+describes a different draft. TLS, HTTP/2, and HTTP/3 remain future milestones.
+This ADR builds on the existing in-flight accounting, sans-IO, buffer-lease,
+and L4 relay decisions.
 
 ## 1. Context
 
@@ -48,8 +40,8 @@ wait (I9), no parked buffers (I10), downward-only layering (ADR 0007).
 | D2 | **`L4Conn` stays outside** the Exchange layer. It shares only primitives (`ChunkPool`, byte queue, `UpstreamPool`, `UpstreamDialer`). |
 | D3 | **Lifecycle per kind, no generic Connection interface.** L4: one slot, socket pair. H1 egress: per-worker idle cache of connections. H2/H3 egress: pooled multiplexed sessions with per-stream generation handles. H3 is UDP/QUIC: it reuses `UpstreamPool` (policy) but not `UpstreamDialer` (mechanism). |
 | D4 | **TLS = sans-IO `TlsSession` (module `tls`) driven by a `Transport` (module `transport`)**; one implementation for server and client role. QUIC shares only the TLS *context* (certs, SNI), not `Transport`. |
-| D5 | **Static files are a body *producer* of an Exchange**, not an upstream: a `FileReader` slot using io_uring `OPENAT2`/`STATX`/`READ` (+ optional `SPLICE`), no `UpstreamPool`. |
-| D6 | New modules **`http`** (sans-IO, no ring) and **`transport`** (ring + TLS); `check_layering.py` and CMake change **when those modules are created**, not now. |
+| D5 | **Static files produce an Exchange response.** The HTTP/1 connection owns its `FileResponder` and counts `OPENAT2`, `STATX`, and `READ` using its existing peer-fd accounting. |
+| D6 | **`http`** holds sans-IO Exchange and handler logic. The future **`transport`** module will drive TLS. CMake and the layering check enforce the dependency direction. |
 
 ## 3. The neutral Exchange layer (D1, D2)
 
@@ -67,7 +59,7 @@ flowchart LR
     E1["H1 client session"]
     E2["H2 client session"]
     E3["H3 client session"]
-    F["FileReader (static)"]
+    F["FileResponder (static)"]
   end
   I1 --> X
   I2 --> X
@@ -101,7 +93,7 @@ headers. Sessions strip these on the way in and synthesize them on the way out.
 | Backpressure (producer side) | stop re-arming `recv` | stop returning window credit | stop reading the stream / not extending flow control |
 | Trailers | chunked trailer section | trailing HEADERS | trailing HEADERS |
 | Abort | close the connection (or `Connection: close`) | RST_STREAM | RESET_STREAM / STOP_SENDING |
-| Tunnel | after 101 / 2xx to CONNECT | CONNECT stream | CONNECT stream |
+| Tunnel | WebSocket after 101 | CONNECT stream (future) | CONNECT stream (future) |
 | Early response | server answers before request body ends | allowed | allowed |
 
 This table is the design's evidence, not a proof. **[assumed]** It has been
@@ -110,19 +102,25 @@ are not in the tree.
 
 ### 3.3 Header block and translation safety
 
-* A neutral `HeaderBlock` is a *bounded* list (`limits.max_headers`,
-  `limits.max_head_bytes`) whose bytes live in Exchange-owned storage, **not**
-  as `string_view`s into an ingress buffer: H2/H3 decode into their own
-  storage, and the H1 head is copied out of the receive buffer (I10).
-* Canonical form is the **strictest common subset**: lower-case names, no
-  CR/LF/NUL in values, no hop-by-hop fields, one `Host`/authority, a single
-  framing decision. The H1 parser's *reject, never normalise* policy
-  (ADR 0005) is the baseline.
-* **Validate on entry and again on exit.** Header values legal in H2/H3 can be
-  illegal and dangerous in H1 (CR/LF injection; `Content-Length`/`Transfer-
-  Encoding` desync when an H2 request is rewritten to H1). Each egress
-  serializer rejects what its protocol cannot represent instead of escaping it.
-  This is the main reason the translation lives in one layer.
+* The Exchange stores request and response metadata. The HTTP/1 session
+  parses the head in its receive or staging buffer and gives the router a
+  request view for that call. A responder that needs the request later
+  serializes or copies the fields into bounded storage before suspending.
+* Response fields and trailers borrow bounded responder storage. That storage
+  remains live through downstream serialization or ingress detach. The
+  Exchange carries field views and two bounded byte streams.
+* The receiver validates its own wire syntax. The serializer validates the
+  outgoing fields and generates hop-by-hop fields and framing. An HTTP/1.1
+  client with `Connection: TE` and `TE: trailers` can receive permitted
+  trailers from a chunked origin response. Request trailers are validated and
+  dropped. Trailer fields stay separate from the head and become visible
+  after the last body byte.
+* Exchange has one informational status slot. A newer status replaces the
+  pending one and a final head clears it. HTTP/1 emits only 100 Continue.
+  An early final response completes the response and then closes the HTTP/1
+  connection when the request body is incomplete.
+* A pre-head responder shutdown maps to 503. A post-head failure aborts the
+  body and the HTTP/1 connection closes.
 
 ### 3.4 BodyStream and backpressure (I6)
 
@@ -153,36 +151,32 @@ L4 keeps its own queue and its own "high watermark + one recv" bound.) The
 precise claim/push/consume/finish/abort contract and its wake rules are in
 [EXCHANGE.md](../EXCHANGE.md) §3.
 
-**Borrow rule.** A byte-stream session (H1, as in L4) may `send` straight from
-`front()` and call `consume()` only after the send CQE. A multiplexed session
-(H2/H3) must *copy* body bytes into its own output buffer or frames when it
-reads them, so no body chunk is borrowed across a CQE that another stream's
-death could outlive. (This keeps an Exchange freeable without waiting for any
-session's in-flight ops.) **[assumed]** nghttp2/nghttp3 data providers copy;
-confirm when M8 starts.
+**Borrow rule.** HTTP/1 copies bytes from the stream's `front()` into a
+session-owned send buffer and consumes the acknowledged bytes on the CQE.
+The backing send buffer survives in-flight I/O even when the Exchange
+aborts the stream and releases its chunks.
 
 ### 3.5 Ownership, wiring, events
 
-* `Exchange` is a fixed-capacity slot in a per-worker `HandlePool<Exchange>`
-  (I7; sized from config, e.g. a `[runtime.pools] exchanges` key — name TBD).
-  Pool exhaustion sheds the request (503 / reset), never allocates.
-* An Exchange refers to each side by `StreamRef{ConnRef conn; stream slot;
-  stream gen}`; sides refer back by `Handle`. This is the "peer link" case
-  where generation checks are real logic, not only a tripwire (I4): either
-  side can die while the other still holds a reference.
-* The Exchange issues **no SQEs**. All in-flight ops belong to sessions and are
-  counted by their `ConnCore` (I2), so the Exchange is freed when both sides
-  have detached, independent of kernel completions.
-* **No re-entrant calls between sessions.** A side that changes state pushes an
-  event (`HeadReady`, `Readable`, `Writable`, `TrailersReady`, `Aborted`) onto a
-  per-worker ready list; the worker drains it after the CQE batch (like
-  `ctx.closed` today), in a bounded number of rounds, and leaves the rest for
-  the next iteration so one fast stream cannot starve the loop. Delivery is a
-  static switch over pool id, in the same place that already knows every
-  concrete type (`runtime`, next to `ConnPools`): no virtual calls.
-* Routing (listener -> route -> handler kind) runs on `HeadReady`. Handlers
-  (`Respond`, `Redirect`, `StaticFile`, `ReverseProxy`) are plain code that
-  attaches a *response producer* to the Exchange; they do not own sockets.
+* Each worker sizes its Exchange pool to its startup HTTP/1 connection
+  capacity. Each HTTP/1 connection has at most one active Exchange. Capacity
+  exhaustion returns 503. Pipelined requests execute serially.
+* An Exchange holds generation-checked peer references. Either side can be
+  force-detached idempotently. Missing ingress delivery triggers detach and
+  another reap check. The pool reaps only after both sides detach.
+* The Exchange issues zero SQEs. Session `ConnCore` instances count the
+  I/O and keep operation buffers and fds alive through completion.
+* State changes raise level hints on a bounded ready list. The worker drains
+  it after each CQE batch and uses nonblocking submission while ready work
+  remains. Delivery checks generations and uses static dispatch.
+* The HTTP/1 ingress adapter selects a route using the accepting listener ID
+  and the current snapshot. Local handlers, files, and upstream HTTP all
+  produce responses through Exchange credit and cancellation.
+* After a matching upstream HTTP/1.1 101 for a bodyless WebSocket GET, the
+  Exchange opens the request stream for tunnel bytes and uses the response
+  stream for unframed downstream bytes. The adapters regenerate the two
+  upgrade headers and continue enforcing stream credit, I/O deadlines, and
+  teardown accounting.
 
 ### 3.6 Why `L4Conn` stays outside (D2)
 
@@ -203,46 +197,28 @@ a `Transport` on its client side. That needs no Exchange.
 |---|---|---|---|---|
 | L4 relay | one pool slot, `ConnCore` + peer fd | the TCP pair | nothing else | done (ADR 0009) |
 | H1 ingress | pool slot (accepted fd) | the client connection; one Exchange at a time | Exchange (by Handle) | M4 |
-| H1 egress | **per-worker idle cache** of connection slots | many requests (keep-alive) | Exchange while checked out | M4 |
+| H1 egress | Active HTTP/1 responder or per-worker idle fd cache | many requests (keep-alive) | active Exchange | M4 |
 | H2 egress | pooled **session** slot per (backend, protocol) | many streams | Exchange via `StreamRef` | M8 |
 | H3 egress | pooled **session** slot, **no per-connection fd** | many streams | Exchange via `StreamRef` | M10 |
-| Static file | `FileReader` slot (the file fd) | one response | Exchange (by Handle) | M4 |
+| Static file | HTTP/1 `FileResponder` | one response | active Exchange | M4 |
 
 ### 4.1 H1 egress: per-worker keep-alive idle pool
 
-* Dial with `UpstreamDialer` (it dials *before any upstream byte is sent*, so
-  its retries remain safe; see 4.5). A finished exchange with a reusable
-  response parks the connection in an idle list keyed by
-  `(UpstreamId, backend, epoch)`, capped per backend, with the keep-alive
-  deadline from `limits.keepalive_timeout` (I9). A reload that changes the
-  upstream bumps its epoch, so stale idle entries are dropped on next touch.
-* **Idle-connection liveness: DECISION DEFERRED TO M4.3.** The roadmap names a
-  `MSG_PEEK` probe at reuse time. That has no cheap async form on io_uring and
-  a synchronous peek on the loop thread is a race of its own, so the choice is
-  genuinely open. Candidates, none of them selected here:
-  1. *Armed idle `recv`:* park the connection with one outstanding `recv` (no
-     provided buffer is consumed until data arrives, so I10 holds). If it
-     completes while idle (EOF, error, stray bytes) evict; at checkout it
-     simply becomes the response read. Avoids a cancel-and-rearm step but makes
-     checkout depend on an operation that may be mid-completion.
-  2. *Cancel-and-rearm / probe at checkout:* park with nothing in flight and
-     verify on reuse (non-blocking `recv(MSG_PEEK)` or a short-lived op).
-     Simpler ownership, but pays a check on every reuse.
-  3. *No liveness check:* reuse blindly and rely on the retry rule below.
-     Cheapest, and may be good enough when retries are safe.
-
-  The deciding evidence is a deterministic test of the race (a peer closing an
-  idle connection while it is being checked out), which needs the `FakeRing`
-  harness (TESTING §4, not yet written). M4.3 therefore starts by building that
-  harness, then picks one candidate with a test that fails for the other
-  designs' failure modes. Nothing in M4.0–M4.2 may depend on the choice: until
-  then H1 egress is connection-per-request (no idle pool at all).
-* `BackendLease` is released when parked and re-acquired at checkout, so
-  least-connections counts *active* use, not idle sockets.
-* The classic race (server closes an idle connection as we send): the request
-  fails with no response byte. Retry only if the method is idempotent, no
-  response byte arrived, and the request body is still replayable (fully held
-  in the stream). Otherwise answer 502. This is the roadmap's rule, kept.
+* Each worker can park up to 64 sockets and four per backend epoch. A
+  socket is eligible after a complete upload and a persistent, self-delimited
+  response with no remaining wire bytes or in-flight peer operations. The
+  idle lifetime uses `limits.keepalive_timeout_ms`. Expiration, upstream epoch
+  changes, and drain close idle sockets. At capacity the new socket closes.
+* On checkout, the worker first selects a backend with the normal balancing
+  policy. It probes that backend's cached socket using
+  `recv(MSG_PEEK | MSG_DONTWAIT)`. EOF, unexpected bytes, and other results
+  evict it. If checkout finds no usable socket, dial the selected backend.
+* `BackendLease` is released when parked and reacquired at checkout.
+  Least-connections measures active exchanges.
+* A peer can close immediately after the probe. The deterministic FakeRing
+  regression covers that race and a later short send. One retry is available
+  to idempotent methods for transient failure before any upstream byte was
+  acknowledged. Once a write succeeds, the original request is never replayed.
 
 ### 4.2 H2/H3 egress: multiplexed sessions and generation handles (I4)
 
@@ -284,8 +260,8 @@ currently cancels `fd()` unconditionally when ops are in flight). **[assumed]**
 ### 4.4 Pool-id budget (DONE in M4.0)
 
 `OpTag` had 3 pool bits (8 ids) with 5 used (Echo, L4, Http1, Http2, Http3).
-This design needs at least Http1Up, Http2Up, Http3Up and FileReader: nine.
-Options were:
+The original budget allowed for separate upstream and file pools in addition
+to ingress pools. The alternatives were:
 
 1. **Take one bit from `kind`** (`OpKind` used 15 of 64 values; 5 bits allow
    32, enough even with Openat/Statx/Close added): `pool` becomes 4 bits
@@ -308,9 +284,9 @@ ADR 0009 noted that `UpstreamDialer` "assumes the owner has not consumed any
 client data; whether that holds for HTTP is part of the M4 decision". Decision:
 the real precondition is **no byte has been delivered to the upstream**, not
 "no byte consumed from the client". For HTTP the request head is already parsed
-into the Exchange and any early body bytes sit in the request `BodyStream`, so
-dial retries remain lossless and duplicate-free. Whether the *request* may be
-retried after the head was sent is the separate policy in 4.1.
+by the ingress adapter and the upstream head is already serialized in bounded
+storage. Early body bytes sit in the request `BodyStream`. The retry policy in
+§4.1 keeps these retries lossless and duplicate-free.
 
 ## 5. TLS: sans-IO adapter shared by ingress and egress (D4)
 
@@ -352,101 +328,36 @@ retried after the head was sent is the separate policy in 4.1.
 
 ## 6. Static files as a response producer (D5)
 
-Static serving is the *other* kind of response producer. The Exchange does not
-care whether response bytes come from an upstream session or a file.
+The HTTP/1 connection owns the file responder for the active Exchange.
+It counts the file-open, metadata, and read SQEs through its `ConnCore`.
+Cancellation and late file-open completions follow the normal fd and
+in-flight accounting rules.
 
-```mermaid
-flowchart LR
-  R["ingress session"] -->|"request head"| X["Exchange"]
-  X -->|"route: StaticFile"| H["StaticFile handler: plan response"]
-  H -->|"attach producer"| F["FileReader slot"]
-  F -->|"READ into chunks"| B["response BodyStream"]
-  B -->|"Readable"| R
-  R -->|"Writable when below low watermark"| F
-```
-
-* **Not an upstream:** no `UpstreamPool`, no `UpstreamDialer`, no health, no
-  `BackendLease`. Selection happens in routing, which yields a root + path.
-* **`FileReader` is its own pool slot** (own `ConnCore`, fd = the file). This
-  reuses I2/I3 unchanged: a `READ` on a file fd is *not* cancelled by the
-  socket's `cancel_fd`, so the file needs its own fd-scoped cancel and its own
-  in-flight count, and it must be able to finish or cancel independently of a
-  client that aborted. The rejected alternative is generalizing `ConnCore` from
-  "fd + peer" to N auxiliary fds, which changes the primitive every connection
-  type depends on. It costs one more pool id (see 4.4).
-* **Async metadata and open:** `OPENAT2` and `STATX` exist as io_uring ops
-  **[checked]** in the installed liburing/kernel headers, so a cold-disk open
-  does not block the loop and no helper thread is needed (ARCHITECTURE §3).
-  `OpKind` needs `Openat`, `Statx`, `Close` added (it has `Read` and `Splice`).
-* **Path safety in depth:** the request path goes through the sans-IO
-  normalizer (mandatory escape tests, ROADMAP M4) *and* `openat2` relative to a
-  pre-opened root dirfd with `RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS`
-  (symlink policy configurable) so the kernel refuses an escape even if the
-  normalizer is wrong. **[assumed]** semantics from kernel documentation
-  (>= 5.6, within our 6.1 floor), not tested here. Root dirfds are created on
-  the control thread and delivered to workers like listener fds (I5, I8), not
-  stored in the snapshot.
-* **Body path:** baseline is `READ` (with file offset) into `ChunkPool` chunks
-  -> response `BodyStream` -> session. Reads are issued only while the stream is
-  below its low watermark, so a slow client bounds both memory and open reads.
-  Works for every ingress protocol and for TLS.
-* **`SPLICE` (file -> pipe -> socket) is optional and benchmark-gated**, same
-  stance as L4. It applies only when the ingress side is H1 over a *plain*
-  socket with a known `Content-Length`; H2/H3 framing and TLS require the copy
-  path (kTLS is out of scope).
-* **Response planning is sans-IO:** `plan(request head, file metadata) ->
-  {status, headers, byte range}` covering `Range`, `If-Modified-Since`,
-  `If-None-Match`/ETag, `HEAD`, content type. Pure function, fuzzable, no
-  ring. Metadata (fd + `statx`) is cached per worker, bounded; invalidation
-  rules are deferred.
+* The control thread pins and publishes root directories. The responder
+  decodes the request target and opens relative to the selected root with
+  `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV`.
+  Tests cover root escape and symlink rejection.
+* **Fresh metadata per request.** Reopen the path and call `STATX` on the
+  same fd that serves the response. This gives the response's validators
+  and range decisions metadata from the opened file and avoids retaining
+  stale path-to-fd mappings across replacements.
+* The sans-IO planner handles GET/HEAD, single byte ranges, weak ETags and
+  Last-Modified validators. If-None-Match takes precedence over
+  If-Modified-Since. HEAD and 304 complete without a body read.
+* The responder claims response credit before issuing `READ` at the file
+  offset. Completed bytes enter the `BodyStream`. Outstanding buffers and
+  fds stay live until their CQEs. A zero-copy path remains optional and
+  benchmark-gated.
 
 ## 7. Layering and build (D6)
 
-Proposed module graph (arrows = "may include/link", downward only). Acyclicity
-of this graph **[checked]** with a throwaway script (not committed):
-
-```mermaid
-flowchart TD
-  runtime --> handlers
-  runtime --> proto_l4
-  runtime --> proto_http1conn
-  runtime --> proto_http2
-  runtime --> proto_http3
-  handlers --> proto_http1conn
-  handlers --> proto_http2
-  handlers --> proto_http3
-  handlers --> http
-  proto_http1conn --> transport
-  proto_http2 --> transport
-  proto_http3 --> transport
-  proto_http1conn --> http
-  proto_http1conn --> proto_http1
-  proto_http1conn --> net
-  proto_l4 --> net
-  transport --> tls
-  transport --> io
-  net --> upstream
-  net --> io
-  http --> mem
-  tls --> config
-  io --> mem
-```
-
-Rules this implies:
-
-* **`http` has no `io` dependency** (like `config`): Exchange state machine,
-  `BodyStream`, `HeaderBlock` and the static-response planner are unit-testable
-  and fuzzable without a kernel ring.
-* **Session modules never include `handlers`.** Ingress sessions emit events;
-  the runtime-level router (next to `ConnPools`) calls handlers. Letting
-  `proto/http1conn` call handlers directly makes a cycle
-  (`proto/http1conn -> handlers -> proto/http1conn`) **[checked]**.
-* **`proto/l4` must not depend on `http`, `transport`, `tls` or `handlers`**
-  (this is how D2 is enforced mechanically).
-* **Until those modules exist, `tools/check_layering.py` and CMake are
-  untouched.** Each milestone adds its module and the matching `ALLOWED`/CMake
-  entries in the same commit; the check must stay at 0 violations at every
-  commit, and `-Werror` stays on for all new targets.
+The current dependency graph is defined in `src/coring5/CMakeLists.txt` and
+`tools/check_layering.py`. The HTTP/1 connection adapter depends on the sans-IO
+HTTP/1 parser and session, the Exchange, the file-root helper, and networking.
+The file-root helper depends downward on HTTP and I/O primitives. The
+sans-IO HTTP and HTTP/1 session libraries remain testable without a ring.
+The L4 adapter depends on the relay primitives. Add matching CMake and
+layering entries when introducing transport and subsequent protocol modules.
 
 ## 8. Alternatives considered
 
@@ -476,52 +387,30 @@ Rules this implies:
 * (-) Trailers, early responses and `100-continue` make the Exchange state
   machine larger than a request/response pair suggests.
 
-**Falsifier (how we will know this ADR is wrong):** the first H2 ingress
-implementation (M8) must not require changes to the Exchange/BodyStream API or
-to H1 code. If it does, or if none of the idle-liveness candidates (4.1) can be
-made race-free under `FakeRing` in M4.3, supersede this ADR instead of patching
-around it.
+**Acceptance for new adapters.** Adding an HTTP/2 ingress adapter should
+preserve HTTP/1 behavior and the Exchange and BodyStream contracts. Validate
+this at M8 when the first multiplexed adapter is implemented.
 
 ## 10. Deferred decisions and non-goals
 
-Not decided here, to be settled in the milestone shown:
-
 | Topic | When |
 |---|---|
-| Exact `Exchange` state machine, `BodyStream` credit rules, trailer rules, early response, 1xx forwarding | **specified in [EXCHANGE.md](../EXCHANGE.md) (design only); implementation M4.1** |
-| Open items of EXCHANGE.md §9 (pool-aware claims, forcing chunked for announced trailers, request-trailer opt-in, `100-continue` details, window-update coalescing) | M4.1–M4.2, M8 |
-| Pipelining policy for H1 ingress (initially: none) | M4.1 |
-| `Exchange` pool sizing/config key and head storage layout (chunk chain vs arena) | M4.1 |
-| ~~`PoolId`/`OpKind` bit split (4.4)~~ | **done in M4.0** |
-| H1 egress idle-connection liveness strategy (4.1) | **M4.3**, after `FakeRing` exists |
-| `ChunkPool` partitioning between L4 and HTTP; renaming `relay_memory_mib` | M4.2 |
-| Idle-cache sizing (`max_idle_keepalive`), eviction order, per-backend caps | M4.3 |
-| Static: metadata cache and invalidation, MIME table, symlink policy, root dirfd delivery, `SPLICE` strategy | M4.4 |
-| Upgrade/WebSocket and CONNECT tunnel details | M4.5 |
-| `Transport` plain/TLS branching strategy, handshake `DeadlineKind`, resumption cache, helper-thread question | M5 |
-| H2 flow-control mapping, stream/header limits, rapid-reset/CONTINUATION defenses, upstream stream saturation policy | M8 |
-| QUIC timers resolution, GSO/GRO, CID steering, migration, 0-RTT, upstream H3 pooling | M10 |
-| Upstream `protocol = "auto"` (ALPN selection), active health checks, consistent hashing | after M8 |
+| Shared chunk-pool reservations, request trailer forwarding opt-in, and announcing response trailers | Follow-up |
+| Generic Upgrade protocols and CONNECT | Follow-up |
+| Static MIME mapping and zero-copy transfer | Follow-up |
+| Transport branching, handshake deadlines, TLS resumption and helper-thread policy | M5 |
+| HTTP/2 flow control, stream/header limits and upstream saturation | M8 |
+| QUIC timers, GSO/GRO, CID steering, 0-RTT and H3 pooling | M10 |
+| ALPN-based upstream protocol selection, active health checks, and consistent hashing | Later |
 
-Explicit non-goals of this ADR and of M4's first milestones: implementing any of
-the above; changing `L4Conn`, `UpstreamDialer`, `UpstreamPool`, ADR 0009, or the
-public config schema; caching, compression, WAF/rate limiting, request
-buffering to disk; kTLS and TLS-in-front-of-L4.
+## 11. M4 delivery sequence
 
-## 11. Proposed M4 sequence (each step demoable, 0 layering violations, `-Werror`)
+1. **M4.0** OpTag bit split and sans-IO Exchange primitives.
+2. **M4.1** HTTP/1 ingress, body framing, serial pipelining, Respond and Redirect.
+3. **M4.2** Streaming reverse proxy and backpressure.
+4. **M4.3** FakeRing lifecycle checks and bounded upstream keep-alive reuse.
+5. **M4.4** StaticFile, validators, ranges and path-escape tests using fresh metadata.
+6. **M4.5** WebSocket negotiation and unframed Exchange streams.
 
-1. **M4.0** `PoolId`/`OpKind` bit split (**done**: `OpTag` is now
-   `gen:32 | index:20 | kind:5 | pool:4 | aux:3`); then the `http` module with
-   `HeaderBlock`, `BodyStream`, `Exchange` state machine and unit tests (no
-   ring) — not started.
-2. **M4.1** H1 ingress + body framing + `Respond`/`Redirect` handlers (no
-   upstream).
-3. **M4.2** H1 egress with connection-per-request via `UpstreamDialer` +
-   `ReverseProxy`; first end-to-end bodies with backpressure tests.
-4. **M4.3** `FakeRing` harness, then the H1 keep-alive idle cache; the idle
-   liveness strategy (4.1) is chosen here, driven by a deterministic race test.
-5. **M4.4** `StaticFile` + `FileReader` + path-escape corpus.
-6. **M4.5** Upgrade/WebSocket tunnel mode.
-
-Then M5 (`Transport` + TLS), M8 (H2), M10 (H3), each validating D1 by adding
-one adapter.
+M5 introduces the TLS transport. M8 and M10 validate the adapter boundary with
+HTTP/2 and HTTP/3, respectively.

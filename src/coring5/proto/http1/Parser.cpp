@@ -74,17 +74,76 @@ constexpr bool is_target_char(unsigned char c) { return c > 0x20 && c < 0x7F; }
 
 } // namespace
 
+bool Header::named(std::string_view key) const noexcept { return iequals(name, key); }
+
 std::string_view RequestHead::find(std::string_view lower_name) const noexcept {
   for (std::size_t i = 0; i < header_count; ++i) {
-    if (iequals(headers[i].name, lower_name)) {
+    if (headers[i].named(lower_name)) {
       return headers[i].value;
     }
   }
   return {};
 }
 
-HeadResult parse_head(std::span<const char> in, const Limits &limits,
-                      RequestHead &out) {
+namespace {
+ParseError request_line(std::string_view line, const Limits &limits,
+                        RequestHead &out) {
+  const std::size_t sp1 = line.find(' ');
+  const std::size_t sp2 =
+      sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
+  if (sp1 == std::string_view::npos || sp2 == std::string_view::npos ||
+      line.find(' ', sp2 + 1) != std::string_view::npos) {
+    return ParseError::BadRequestLine;
+  }
+  out.method = line.substr(0, sp1);
+  out.target = line.substr(sp1 + 1, sp2 - sp1 - 1);
+  const std::string_view version = line.substr(sp2 + 1);
+
+  if (out.method.empty() || !std::ranges::all_of(out.method, [](char c) {
+        return is_tchar(static_cast<unsigned char>(c));
+      })) {
+    return ParseError::BadMethod;
+  }
+  if (out.target.empty()) {
+    return ParseError::BadRequestLine;
+  }
+  if (out.target.size() > limits.max_uri_bytes) {
+    return ParseError::UriTooLong;
+  }
+  if (!std::ranges::all_of(out.target, [](char c) {
+        return is_target_char(static_cast<unsigned char>(c));
+      })) {
+    return ParseError::BadRequestLine;
+  }
+  if (version == "HTTP/1.1") {
+    out.minor_version = 1;
+  } else if (version == "HTTP/1.0") {
+    out.minor_version = 0;
+  } else {
+    return ParseError::BadVersion;
+  }
+
+  return ParseError::None;
+}
+
+ParseError status_line(std::string_view line, RequestHead &out,
+                       uint16_t &status) {
+  if (line.size() < 13 ||
+      (!line.starts_with("HTTP/1.1 ") && !line.starts_with("HTTP/1.0 ")) ||
+      line[12] != ' ') {
+    return ParseError::BadVersion;
+  }
+  const auto [end, ec] =
+      std::from_chars(line.data() + 9, line.data() + 12, status);
+  if (ec != std::errc{} || end != line.data() + 12 || status < 100 ||
+      status > 599) {
+    return ParseError::BadRequestLine;
+  }
+  out.minor_version = static_cast<uint8_t>(line[7] - '0');
+  return ParseError::None;
+}
+HeadResult parse(std::span<const char> in, const Limits &limits,
+                      RequestHead &out, uint16_t *status) {
   const std::string_view buf(in.data(), in.size());
   out = RequestHead{};
 
@@ -131,41 +190,9 @@ HeadResult parse_head(std::span<const char> in, const Limits &limits,
   const std::string_view line = head.substr(0, rl_end);
   head.remove_prefix(rl_end + 2);
 
-  const std::size_t sp1 = line.find(' ');
-  const std::size_t sp2 =
-      sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
-  if (sp1 == std::string_view::npos || sp2 == std::string_view::npos ||
-      line.find(' ', sp2 + 1) != std::string_view::npos) {
-    return fail(ParseError::BadRequestLine);
-  }
-  out.method = line.substr(0, sp1);
-  out.target = line.substr(sp1 + 1, sp2 - sp1 - 1);
-  const std::string_view version = line.substr(sp2 + 1);
-
-  if (out.method.empty() || !std::ranges::all_of(out.method, [](char c) {
-        return is_tchar(static_cast<unsigned char>(c));
-      })) {
-    return fail(ParseError::BadMethod);
-  }
-  if (out.target.empty()) {
-    return fail(ParseError::BadRequestLine);
-  }
-  if (out.target.size() > limits.max_uri_bytes) {
-    return fail(ParseError::UriTooLong);
-  }
-  if (!std::ranges::all_of(out.target, [](char c) {
-        return is_target_char(static_cast<unsigned char>(c));
-      })) {
-    return fail(ParseError::BadRequestLine);
-  }
-  if (version == "HTTP/1.1") {
-    out.minor_version = 1;
-  } else if (version == "HTTP/1.0") {
-    out.minor_version = 0;
-  } else {
-    return fail(ParseError::BadVersion);
-  }
-
+  const auto error = status ? status_line(line, out, *status)
+                            : request_line(line, limits, out);
+  if (error != ParseError::None) return fail(error);
   // ---- headers ----
   const std::size_t max_headers =
       std::min<std::size_t>(limits.max_headers, kMaxHeadersHard);
@@ -262,13 +289,23 @@ HeadResult parse_head(std::span<const char> in, const Limits &limits,
   if (out.chunked && out.minor_version == 0) {
     return fail(ParseError::BadTransferEncoding); // TE is HTTP/1.1 only
   }
-  if (out.minor_version == 1 && out.host.empty()) {
+  if (!status && out.minor_version == 1 && out.host.empty()) {
     return fail(ParseError::MissingHost); // RFC 9112 3.2: exactly one Host
   }
   // `close` always wins; HTTP/1.0 persists only on an explicit keep-alive.
   out.keep_alive = !saw_close && (out.minor_version == 1 || saw_keep_alive);
-  // TODO(M4): body framing for requests (chunked decoder state machine).
   return HeadResult{ParseStatus::Done, ParseError::None, head_len};
+}
+
+} // namespace
+
+HeadResult parse_head(std::span<const char> in, const Limits &limits,
+                      RequestHead &out) {
+  return parse(in, limits, out, nullptr);
+}
+HeadResult parse_response_head(std::span<const char> in, const Limits &limits,
+                               RequestHead &out, uint16_t &status) {
+  return parse(in, limits, out, &status);
 }
 
 } // namespace Coring5::Http1

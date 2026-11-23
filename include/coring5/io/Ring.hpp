@@ -18,19 +18,15 @@
 #include "coring5/base/Result.hpp"
 #include "coring5/io/Cqe.hpp"
 #include "coring5/io/OpTag.hpp"
+#include "coring5/io/RingConfig.hpp"
 #include <cstdint>
 #include <liburing.h>
+#include <linux/openat2.h>
+#include <sys/stat.h>
 #include <memory>
 #include <sys/socket.h>
 
 namespace Coring5 {
-
-struct RingConfig {
-  uint32_t sq_entries{2048};
-  uint32_t cq_entries{8192};
-  bool defer_taskrun{true};
-  bool enforce_min_kernel{true}; // reject kernels older than 6.1
-};
 
 struct RingCaps {
   unsigned kernel_major{0};
@@ -58,7 +54,15 @@ public:
 
   // --- submission (all return false if no SQE could be obtained) ---
   [[nodiscard]] bool accept_multishot(int listen_fd, OpTag tag) noexcept;
+  [[nodiscard]] bool poll_disconnect(int fd, OpTag tag) noexcept;
   [[nodiscard]] bool poll_multishot(int fd, OpTag tag) noexcept;
+  [[nodiscard]] bool open_file(int dir, const char *path, open_how *how,
+                               OpTag tag) noexcept;
+  [[nodiscard]] bool stat_file(int fd, unsigned fields, struct statx *out,
+                               OpTag tag) noexcept;
+  [[nodiscard]] bool read_file(int fd, void *buf, uint32_t len, uint64_t offset,
+                               OpTag tag) noexcept;
+  [[nodiscard]] bool cancel_tag(OpTag target, OpTag tag) noexcept;
   // Single-shot recv into a buffer chosen from provided-buffer group `bgid`.
   [[nodiscard]] bool recv_provided(int fd, uint16_t bgid, OpTag tag) noexcept;
   // Single-shot recv into caller-owned memory (must outlive the operation).

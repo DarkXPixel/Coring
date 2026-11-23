@@ -1,4 +1,5 @@
 find_package(GTest REQUIRED)
+find_package(Threads REQUIRED)
 include(GoogleTest)
 
 # Tests must not fail the build on warnings from gtest macros.
@@ -25,9 +26,11 @@ coring5_add_test(coring5_unit_base   SOURCES unit/base_test.cpp   LIBS coring5_b
 coring5_add_test(coring5_unit_mem    SOURCES unit/handle_pool_test.cpp LIBS coring5_mem)
 coring5_add_test(coring5_unit_optag  SOURCES unit/optag_test.cpp  LIBS coring5_io)
 coring5_add_test(coring5_unit_timer  SOURCES unit/timer_wheel_test.cpp LIBS coring5_io)
-coring5_add_test(coring5_unit_config SOURCES unit/config_test.cpp LIBS coring5_config)
+coring5_add_test(coring5_unit_config SOURCES unit/config_test.cpp unit/routes_test.cpp LIBS coring5_config)
 coring5_add_test(coring5_unit_http1  SOURCES unit/http1_parser_test.cpp LIBS coring5_proto_http1)
-coring5_add_test(coring5_unit_obs    SOURCES unit/obs_test.cpp    LIBS coring5_obs)
+coring5_add_test(coring5_unit_obs    SOURCES unit/obs_test.cpp unit/access_log_writer_test.cpp LIBS coring5_obs)
+coring5_add_test(coring5_unit_control SOURCES unit/control_server_test.cpp LIBS coring5_control)
+coring5_enable_warnings(coring5_unit_control)
 coring5_add_test(coring5_unit_relay  SOURCES unit/relay_test.cpp  LIBS coring5_proto_l4)
 coring5_add_test(coring5_unit_http    SOURCES unit/body_stream_test.cpp unit/exchange_test.cpp unit/exchange_random_test.cpp LIBS coring5_http)
 coring5_add_test(coring5_unit_body_framing SOURCES unit/body_framing_test.cpp LIBS coring5_http coring5_proto_http1)
@@ -48,23 +51,41 @@ coring5_add_test(coring5_unit_server_session SOURCES unit/server_session_test.cp
 # The io sources the connection type needs (ConnCore, TimerWheel) are compiled
 # into the test too, so EVERY translation unit sees the same IoContext (the fake
 # ring). Linking coring5_io would mix the two definitions (ODR).
+set(CORING5_SRC ${PROJECT_SOURCE_DIR}/src/coring5)
+set(CORING5_FAKE_HTTP_SOURCES
+  ${CORING5_SRC}/net/IdleUpstreams.cpp ${CORING5_SRC}/net/UpstreamDialer.cpp ${CORING5_SRC}/handlers/StaticFileRoot.cpp
+  ${CORING5_SRC}/proto/http1conn/FileResponder.cpp ${CORING5_SRC}/proto/http1conn/ProxyResponder.cpp
+  ${CORING5_SRC}/proto/http1conn/Http1Conn.cpp)
 set(CORING5_FAKE_RING_IO_SOURCES
   ${PROJECT_SOURCE_DIR}/src/coring5/io/ConnCore.cpp
   ${PROJECT_SOURCE_DIR}/src/coring5/io/TimerWheel.cpp)
 coring5_add_test(coring5_unit_http1_conn
-  SOURCES unit/http1_conn_test.cpp ${PROJECT_SOURCE_DIR}/src/coring5/proto/http1conn/Http1Conn.cpp ${CORING5_FAKE_RING_IO_SOURCES}
-  LIBS coring5_http coring5_proto_http1 coring5_proto_http1session coring5_mem coring5_obs coring5_config coring5_base
+  SOURCES unit/http1_conn_test.cpp unit/http1_adapters_test.cpp ${CORING5_FAKE_HTTP_SOURCES} ${CORING5_FAKE_RING_IO_SOURCES}
+  LIBS coring5_upstream coring5_http coring5_proto_http1 coring5_proto_http1session coring5_mem coring5_obs coring5_config coring5_base
   DEFINES CORING5_FAKE_RING)
 coring5_add_test(coring5_unit_http1_conn_fake
-  SOURCES unit/http1_conn_fake_test.cpp ${PROJECT_SOURCE_DIR}/src/coring5/proto/http1conn/Http1Conn.cpp ${CORING5_FAKE_RING_IO_SOURCES}
-  LIBS coring5_http coring5_proto_http1 coring5_proto_http1session coring5_mem coring5_obs coring5_config coring5_base
+  SOURCES unit/http1_conn_fake_test.cpp ${CORING5_FAKE_HTTP_SOURCES} ${CORING5_FAKE_RING_IO_SOURCES}
+  LIBS coring5_upstream coring5_http coring5_proto_http1 coring5_proto_http1session coring5_mem coring5_obs coring5_config coring5_base
   DEFINES CORING5_FAKE_RING)
+
+# Build the whole worker dispatch path against the same IoContext as the test.
+coring5_add_test(coring5_unit_worker_fake
+  SOURCES unit/worker_fake_test.cpp ${CORING5_FAKE_RING_IO_SOURCES}
+    ${CORING5_SRC}/runtime/Worker.cpp ${CORING5_SRC}/runtime/Mailbox.cpp
+    ${CORING5_FAKE_HTTP_SOURCES}
+    ${CORING5_SRC}/proto/l4/EchoConn.cpp ${CORING5_SRC}/proto/l4/L4Conn.cpp
+    ${CORING5_SRC}/proto/http2/Http2Conn.cpp ${CORING5_SRC}/proto/http3/Http3Conn.cpp
+  LIBS coring5_proto_http1session coring5_upstream coring5_obs Threads::Threads
+  DEFINES CORING5_FAKE_RING)
+coring5_enable_warnings(coring5_unit_worker_fake)
 
 # ---- integration tests (real io_uring + sockets) -----------------------------
 coring5_add_test(coring5_it_echo NEEDS_RING
   SOURCES integration/echo_test.cpp LIBS coring5_runtime)
 coring5_add_test(coring5_it_reload NEEDS_RING
   SOURCES integration/reload_test.cpp LIBS coring5_runtime)
+coring5_add_test(coring5_it_http1_handlers NEEDS_RING
+  SOURCES integration/http1_handlers_test.cpp LIBS coring5_runtime)
 coring5_add_test(coring5_it_l4 NEEDS_RING
   SOURCES integration/l4_test.cpp LIBS coring5_runtime)
 

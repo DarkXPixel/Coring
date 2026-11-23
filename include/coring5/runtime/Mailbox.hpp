@@ -9,12 +9,15 @@
 #include "coring5/base/Types.hpp"
 #include "coring5/config/Snapshot.hpp"
 #include "coring5/io/FdOwner.hpp"
+#include "coring5/upstream/UpstreamPool.hpp"
 #include <memory>
 #include <mutex>
 #include <variant>
 #include <vector>
 
 namespace Coring5 {
+
+struct StaticRoots;
 
 struct ListenerFd {
   ListenerId id;
@@ -28,6 +31,8 @@ struct ApplyConfig {
   std::vector<ListenerFd> add;
   std::vector<ListenerId> remove;
   std::shared_ptr<ReloadAck> ack; // may be null
+  std::shared_ptr<const StaticRoots> roots{};
+  UpstreamPool upstreams{};
 };
 
 struct Shutdown {

@@ -88,6 +88,8 @@ public:
   // Only the worker, at a safe point, for connections that reached Closed.
   bool destroy(Handle h) noexcept { return pool_.destroy(h); }
 
+  [[nodiscard]] const T *get(Handle h) noexcept { return pool_.get(h); }
+
   [[nodiscard]] uint32_t live() const noexcept { return pool_.live(); }
   [[nodiscard]] uint32_t capacity() const noexcept { return pool_.capacity(); }
 

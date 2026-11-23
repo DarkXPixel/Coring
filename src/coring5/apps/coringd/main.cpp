@@ -90,6 +90,10 @@ int main(int argc, char **argv) {
   }
 
   std::fputs("coringd: shutting down\n", stderr);
-  daemon.stop();
+  if (auto r = daemon.stop(); !r) {
+    std::fprintf(stderr, "coringd: access log: %s\n",
+                 std::strerror(r.error().sys));
+    return 1;
+  }
   return 0;
 }

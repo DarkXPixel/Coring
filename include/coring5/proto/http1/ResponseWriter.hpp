@@ -43,6 +43,7 @@ public:
   // `minor` is 0 or 1; status in [100, 599].
   Errc status_line(uint16_t status, uint8_t minor = 1,
                    std::string_view reason = {}) noexcept;
+  Errc request_line(std::string_view method, std::string_view target, uint8_t minor) noexcept;
   Errc header(std::string_view name, std::string_view value) noexcept;
   Errc content_length(uint64_t n) noexcept;
   Errc chunked() noexcept { return header("Transfer-Encoding", "chunked"); }

@@ -54,6 +54,14 @@ std::string render_metrics(std::span<const WorkerMetrics> shards) {
        sum(shards, [](auto &m) -> auto & { return m.bytes_in; }));
   line("bytes_out_total",
        sum(shards, [](auto &m) -> auto & { return m.bytes_out; }));
+  line("trailers_forwarded_total",
+       sum(shards, [](auto &m) -> auto & { return m.trailers_forwarded; }));
+  line("trailers_dropped_total",
+       sum(shards, [](auto &m) -> auto & { return m.trailers_dropped; }));
+  line("trailers_rejected_total",
+       sum(shards, [](auto &m) -> auto & { return m.trailers_rejected; }));
+  line("access_log_dropped_total",
+       sum(shards, [](auto &m) -> auto & { return m.access_log_dropped; }));
   line("loop_iterations_total",
        sum(shards, [](auto &m) -> auto & { return m.loop_iterations; }));
   line("cqes_total", sum(shards, [](auto &m) -> auto & { return m.cqes; }));

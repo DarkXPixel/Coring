@@ -27,6 +27,8 @@ ALLOWED = {
     "proto/http1session": {"base", "mem", "config", "http", "proto/http1"},
     "proto/l4": {"base", "io", "config", "obs", "mem", "net", "upstream"},
     "proto/http1conn": {
+        "handlers",
+        "net",
         "base",
         "io",
         "config",
@@ -43,6 +45,7 @@ ALLOWED = {
     "handlers": {"base", "http", "io", "proto/http1", "upstream"},
     "control": set(),
     "runtime": {
+        "handlers",
         "base",
         "mem",
         "config",

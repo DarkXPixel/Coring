@@ -40,26 +40,34 @@ UpstreamPool::resolve(BackendRef ref) const noexcept {
   return const_cast<UpstreamPool *>(this)->resolve(ref);
 }
 
-void UpstreamPool::apply_config(const ConfigSnapshot &snapshot) {
-  std::vector<Entry> next;
-  next.reserve(snapshot.upstreams.size());
+UpstreamPool UpstreamPool::prepare(const ConfigSnapshot &snapshot) {
+  UpstreamPool next;
+  next.entries_.reserve(snapshot.upstreams.size());
   for (const auto &spec : snapshot.upstreams) {
-    Entry *old = find(spec.id);
-    if (old != nullptr && old->spec == spec) {
-      next.push_back(std::move(*old)); // unchanged: keep state AND epoch
-      continue;
-    }
-    Entry e;
-    e.spec = spec;
-    e.state.assign(spec.backends.size(), BackendState{});
-    e.epoch = ++epoch_counter_;
-    if (epoch_counter_ ==
-        0) { // 2^32 reloads of changed upstreams: skip invalid
-      e.epoch = ++epoch_counter_;
-    }
-    next.push_back(std::move(e));
+    auto &entry = next.entries_.emplace_back();
+    entry.spec = spec;
+    entry.state.resize(spec.backends.size());
   }
-  entries_ = std::move(next);
+  return next;
+}
+
+void UpstreamPool::install(UpstreamPool &prepared) noexcept {
+  for (auto &entry : prepared.entries_) {
+    if (auto *old = find(entry.spec.id); old && old->spec == entry.spec) {
+      std::swap(entry, *old);
+    } else {
+      if (++epoch_counter_ == 0) {
+        ++epoch_counter_;
+      }
+      entry.epoch = epoch_counter_;
+    }
+  }
+  entries_.swap(prepared.entries_);
+}
+
+void UpstreamPool::apply_config(const ConfigSnapshot &snapshot) {
+  auto prepared = prepare(snapshot);
+  install(prepared);
 }
 
 uint32_t UpstreamPool::select(Entry &e, TimePoint now,

@@ -7,11 +7,16 @@ namespace Coring5 {
 
 WorkerGroup::~WorkerGroup() { shutdown(Millis{1000}); }
 
-std::expected<void, std::string> WorkerGroup::start(const RuntimeConfig &rt) {
+std::expected<void, std::string>
+WorkerGroup::start(const RuntimeConfig &rt,
+                   std::span<AccessLogRing> access_logs) {
   if (running_) {
     return std::unexpected("workers already started");
   }
   const std::size_t n = rt.workers;
+  if (!access_logs.empty() && access_logs.size() != n) {
+    return std::unexpected("expected one access-log ring per worker");
+  }
   metrics_ = std::make_unique<WorkerMetrics[]>(n);
   mailboxes_.clear();
   for (std::size_t i = 0; i < n; ++i) {
@@ -36,7 +41,8 @@ std::expected<void, std::string> WorkerGroup::start(const RuntimeConfig &rt) {
                   .runtime = rt,
                   .cpu = rt.cpus.empty() ? -1 : rt.cpus[i],
                   .mailbox = mailboxes_[i].get(),
-                  .metrics = &metrics_[i]};
+                  .metrics = &metrics_[i],
+                  .access_log = access_logs.empty() ? nullptr : &access_logs[i]};
     threads_.emplace_back(
         [wi, go_future, p = std::move(init_result)]() mutable {
           Worker w(wi); // constructed on its own thread

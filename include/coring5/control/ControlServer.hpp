@@ -5,9 +5,8 @@
 //   ping | reload | stats | status | shutdown
 //
 // Security: socket mode 0660 + SO_PEERCRED check (same uid as the daemon, or
-// root). Clients are served one at a time with a short receive timeout so a
-// stalled client cannot hold the control plane for long.
-// TODO(M2): replace by an event-driven implementation (own small ring/epoll).
+// root). A dedicated poll loop multiplexes bounded nonblocking clients.
+// Command handlers run serially on the control thread.
 
 #include <atomic>
 #include <functional>
@@ -37,7 +36,8 @@ public:
 
 private:
   void run();
-  void serve(int client);
+  struct Client;
+  bool service(Client &client, short events);
   [[nodiscard]] std::string execute(std::string_view cmd);
 
   std::string path_;

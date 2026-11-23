@@ -6,7 +6,7 @@
 // deadlines and call detach(self, Timeout)). Events are raised AFTER the state
 // change and put the Exchange on the ReadyList (once).
 //
-// Head bytes are not stored here yet (open question); only the metadata.
+// Header fields can borrow responder-owned bytes until ingress serializes them.
 
 #include "coring5/base/Result.hpp"
 #include "coring5/base/Types.hpp"
@@ -14,6 +14,7 @@
 #include "coring5/http/ReadyList.hpp"
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 namespace Coring5 {
 
@@ -39,6 +40,11 @@ struct ResponseMeta {
   uint64_t declared{0};
 };
 
+struct ResponseField {
+  std::string_view name;
+  std::string_view value;
+};
+
 [[nodiscard]] constexpr bool content_forbidden(uint16_t status,
                                                bool head_only) noexcept {
   return head_only || status < 200 || status == 204 || status == 304;
@@ -50,6 +56,7 @@ struct ResponseMeta {
     return 504;
   case Errc::UpstreamUnavailable:
   case Errc::Overloaded:
+  case Errc::Shutdown:
     return 503;
   default:
     return 502;
@@ -93,8 +100,23 @@ public:
   [[nodiscard]] HeadStatus respond_synthetic(uint16_t status) noexcept;
   // E3: 1xx (not 101); 1-slot, a newer one replaces a pending one.
   [[nodiscard]] HeadStatus publish_interim(uint16_t status) noexcept;
+  // The adapter validates a 101 handshake before switching both streams to
+  // unframed bytes. Only an HTTP request with no body can switch.
+  [[nodiscard]] HeadStatus
+  publish_tunnel(std::span<const ResponseField> fields) noexcept;
+  [[nodiscard]] bool tunneling() const noexcept { return res_meta_.status == 101; }
   // E4: final head; opens the ResStream gate (R1).
-  [[nodiscard]] HeadStatus publish_final(const ResponseMeta &meta) noexcept;
+  // The responder keeps fields and their bytes alive through synchronous
+  // ingress serialization or until ingress detaches. Framing and hop-by-hop
+  // fields belong to the session.
+  [[nodiscard]] HeadStatus
+  publish_final(const ResponseMeta &meta,
+                std::span<const ResponseField> fields = {}) noexcept;
+  [[nodiscard]] std::span<const ResponseField> take_response_fields() noexcept {
+    const auto fields = response_fields_;
+    response_fields_ = {};
+    return fields;
+  }
   // Pending interim status (0 = none); clears it.
   [[nodiscard]] uint16_t take_interim() noexcept {
     const uint16_t s = interim_;
@@ -115,6 +137,14 @@ public:
                                  std::span<const std::byte> d) noexcept;
   [[nodiscard]] WriteStatus finish(StreamId s,
                                    bool has_trailers = false) noexcept;
+  // Borrowed responder fields, like the head. The consumer sees them only
+  // after draining the body.
+  [[nodiscard]] WriteStatus
+  finish_response(std::span<const ResponseField> trailers) noexcept;
+  [[nodiscard]] std::span<const ResponseField> response_trailers() const noexcept {
+    return res_.trailers_available() ? response_trailers_
+                                     : std::span<const ResponseField>{};
+  }
   void consume(StreamId s, uint32_t n) noexcept;
   [[nodiscard]] bool wait_readable(StreamId s) noexcept;
   void abort(StreamId s, Errc why) noexcept;
@@ -171,7 +201,8 @@ private:
   void harvest() noexcept;
   void raise(uint16_t e) noexcept;
   [[nodiscard]] bool gate(StreamId s) noexcept;
-  [[nodiscard]] HeadStatus publish(ResponseMeta meta) noexcept;
+  [[nodiscard]] HeadStatus
+  publish(ResponseMeta meta, std::span<const ResponseField> fields = {}) noexcept;
   [[nodiscard]] BodyStream &mut(StreamId s) noexcept {
     return s == StreamId::Req ? req_ : res_;
   }
@@ -184,6 +215,8 @@ private:
   SideRef responder_{};
   RequestMeta req_meta_;
   ResponseMeta res_meta_{};
+  std::span<const ResponseField> response_fields_;
+  std::span<const ResponseField> response_trailers_;
   uint16_t ing_events_{0};
   uint16_t resp_events_{0};
   uint16_t interim_{0};

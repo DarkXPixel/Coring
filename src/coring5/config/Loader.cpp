@@ -1,10 +1,12 @@
 #include "coring5/config/Loader.hpp"
 
+#include "RouteLoader.hpp"
 #include <algorithm>
 #include <arpa/inet.h>
 #include <bit>
 #include <format>
 #include <fstream>
+#include <limits.h>
 #include <netinet/in.h>
 #include <set>
 #include <sstream>
@@ -33,10 +35,9 @@ std::expected<ProtocolKind, std::string> parse_protocol(std::string_view s) {
   return std::unexpected(std::format("unknown protocol '{}'", s));
 }
 
-// Which protocols a listener may use today (docs/ROADMAP.md). l4 relays; http1 runs
-// the real session (keep-alive, bodies) but answers 501 until handlers land;
-// http2/http3 stay rejected: a listener that can only close is a footgun in a
-// real configuration, even though their pools exist.
+// Which protocols a listener may use today (docs/ROADMAP.md). l4 relays, and
+// http1 runs the server session and local route handlers. http2/http3 pools
+// exist for future protocol support.
 bool protocol_implemented(ProtocolKind p) {
   return p == ProtocolKind::Echo || p == ProtocolKind::L4 ||
          p == ProtocolKind::Http1;
@@ -152,6 +153,11 @@ ConfigResult parse_config(std::string_view text) {
   }
 
   ParsedConfig out;
+  auto routes = parse_routes(root);
+  if (!routes) {
+    return std::unexpected(std::move(routes.error()));
+  }
+  out.routes = std::move(*routes);
 
   if (const auto *rt = root["runtime"].as_table()) {
     auto &r = out.runtime;
@@ -197,6 +203,34 @@ ConfigResult parse_config(std::string_view text) {
     }
   } else if (root.contains("runtime")) {
     return std::unexpected("'runtime' must be a table");
+  }
+
+  if (const auto *log = root["access_log"].as_table()) {
+    for (const auto &[key, node] : *log) {
+      const auto name = key.str();
+      if (name == "path") {
+        continue;
+      }
+      if (name != "rotate_bytes" && name != "rotate_files") {
+        return std::unexpected(
+            std::format("[access_log] unknown key '{}'", name));
+      }
+      if (!node.is_integer()) {
+        return std::unexpected(std::format(
+            "[access_log] '{}' must be a non-negative integer", name));
+      }
+    }
+    auto path = (*log)["path"].value<std::string>();
+    if (!path || path->empty()) {
+      return std::unexpected("[access_log] 'path' must be a non-empty string");
+    }
+    out.access_log.path = std::move(*path);
+    C5_TRY(read_uint(*log, "rotate_bytes", out.access_log.rotate_bytes,
+                    "access_log"));
+    C5_TRY(read_uint(*log, "rotate_files", out.access_log.rotate_files,
+                    "access_log"));
+  } else if (root.contains("access_log")) {
+    return std::unexpected("'access_log' must be a table");
   }
 
   if (const auto *lt = root["limits"].as_table()) {
@@ -279,7 +313,13 @@ ConfigResult parse_config(std::string_view text) {
       ListenerSpec spec;
       spec.name = (*t)["name"].value_or(std::string{});
       spec.address = (*t)["address"].value_or(std::string{});
-      spec.route = (*t)["route"].value_or(std::string{});
+      if (t->contains("route")) {
+        auto route = (*t)["route"].value<std::string>();
+        if (!route) {
+          return std::unexpected("listener route must be a string");
+        }
+        spec.route = std::move(*route);
+      }
       spec.upstream = (*t)["upstream"].value_or(std::string{});
       spec.tls = (*t)["tls"].value_or(std::string{});
       if (spec.name.empty()) {
@@ -398,6 +438,25 @@ ConfigResult load_config_file(const std::string &path) {
 }
 
 std::expected<void, std::string> validate_config(const ParsedConfig &cfg) {
+  const auto &log = cfg.access_log;
+  if ((log.rotate_bytes == 0) != (log.rotate_files == 0) ||
+      (log.path.empty() && log.rotate_bytes != 0)) {
+    return std::unexpected(
+        "[access_log] rotation requires path, positive rotate_bytes and "
+        "rotate_files in 1..255");
+  }
+  if (!log.path.empty()) {
+    const auto basename = std::string_view(log.path).substr(
+        log.path.find_last_of('/') + 1);
+    const std::size_t suffix =
+        log.rotate_files == 0 ? 0 : 1 + std::to_string(log.rotate_files).size();
+    if (log.path.find('\0') != std::string::npos || basename.empty() ||
+        basename == "." || basename == ".." ||
+        basename.size() + suffix > NAME_MAX ||
+        log.path.size() + suffix >= PATH_MAX) {
+      return std::unexpected("[access_log] invalid path or archive name");
+    }
+  }
   const auto &r = cfg.runtime;
   if (r.workers == 0 || r.workers > 1024) {
     return std::unexpected("[runtime] workers must be in 1..1024");
@@ -558,7 +617,7 @@ std::expected<void, std::string> validate_config(const ParsedConfig &cfg) {
           s.name, to_string(pool_for(s.protocol))));
     }
   }
-  return {};
+  return validate_routes(cfg);
 }
 
 } // namespace Coring5

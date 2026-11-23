@@ -128,6 +128,21 @@ Errc ResponseWriter::status_line(uint16_t status, uint8_t minor,
   return put("\r\n");
 }
 
+Errc ResponseWriter::request_line(std::string_view method,
+                                  std::string_view target,
+                                  uint8_t minor) noexcept {
+  if (len_ != 0 || !is_valid_field_name(method) || target.empty() ||
+      minor > 1 || !std::ranges::all_of(target, [](unsigned char c) {
+        return c > 0x20 && c < 0x7f;
+      })) {
+    return fail(Errc::InvalidArgument);
+  }
+  put(method);
+  put(" ");
+  put(target);
+  return put(minor ? " HTTP/1.1\r\n" : " HTTP/1.0\r\n");
+}
+
 Errc ResponseWriter::header(std::string_view name,
                             std::string_view value) noexcept {
   if (err_ != Errc::Ok) {

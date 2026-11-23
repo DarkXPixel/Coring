@@ -64,8 +64,15 @@ public:
   // Errors: WrongPhase/Gone/aborted stream -> Errc::Canceled.
   [[nodiscard]] Result<ApplyStatus> apply(Exchange &ex,
                                           ApplyCursor &cur) const noexcept;
+  // Apply prevalidated configuration bytes without constructing an owning
+  // handler on the data path. Fields follow Exchange::publish_final's lifetime.
+  [[nodiscard]] static Result<ApplyStatus>
+  apply(Exchange &ex, ApplyCursor &cur, uint16_t status, std::string_view body,
+        std::span<const ResponseField> fields = {}) noexcept;
 
 private:
+  friend class Redirect;
+
   uint16_t status_{0};
   std::vector<StaticHeader> headers_;
   std::string body_;
@@ -85,7 +92,7 @@ public:
 
   [[nodiscard]] uint16_t status() const noexcept { return resp_.status(); }
   [[nodiscard]] std::string_view location() const noexcept {
-    return resp_.headers().front().value;
+    return resp_.headers_.front().value;
   }
   [[nodiscard]] const Respond &response() const noexcept { return resp_; }
   [[nodiscard]] std::span<const StaticHeader> headers() const noexcept {
@@ -94,6 +101,12 @@ public:
   [[nodiscard]] Result<ApplyStatus> apply(Exchange &ex,
                                           ApplyCursor &cur) const noexcept {
     return resp_.apply(ex, cur);
+  }
+  // location is a prevalidated Location field in responder-owned storage.
+  [[nodiscard]] static Result<ApplyStatus>
+  apply(Exchange &ex, ApplyCursor &cur, uint16_t status,
+        const ResponseField &location) noexcept {
+    return Respond::apply(ex, cur, status, {}, std::span{&location, 1});
   }
 
 private:
@@ -117,10 +130,11 @@ struct StaticFileMetadata {
 };
 
 struct StaticFileConditions {
-  std::string_view if_none_match{};
+  std::optional<std::string_view> if_none_match{};
   std::optional<std::string_view> range{};
   // Any If-Range requires a strong validator, which this handler lacks.
   bool has_if_range{false};
+  std::optional<std::string_view> if_modified_since{};
 };
 
 struct StaticFileStep {
@@ -144,6 +158,10 @@ public:
   [[nodiscard]] std::string_view etag() const noexcept {
     return {etag_.data(), etag_size_};
   }
+  [[nodiscard]] std::string_view last_modified() const noexcept {
+    return last_modified_.front() == '\0' ? std::string_view{}
+                                         : std::string_view(last_modified_.data(), 29);
+  }
   [[nodiscard]] static constexpr std::string_view accept_ranges() noexcept {
     return "bytes";
   }
@@ -155,7 +173,8 @@ public:
   // the file and the I/O buffer and keeps both alive until read completion.
   // read_capacity is the size of that buffer and must be nonzero for a body.
   [[nodiscard]] Result<StaticFileStep>
-  apply(Exchange &ex, ApplyCursor &cur, uint32_t read_capacity) const noexcept;
+  apply(Exchange &ex, ApplyCursor &cur, uint32_t read_capacity,
+        std::span<const ResponseField> fields = {}) const noexcept;
   // Completes one Read. Report read and submission failures here to abort
   // the stream and return credit. A short, positive read makes progress.
   // EOF before the declared length aborts the stream.
@@ -172,16 +191,14 @@ private:
   std::array<char, 112> etag_{};
   // "bytes " plus three uint64_t decimal fields and two separators.
   std::array<char, 68> content_range_{};
+  std::array<char, 30> last_modified_{};
   std::size_t etag_size_{0};
   std::size_t content_range_size_{0};
   uint16_t status_{200};
   bool head_only_{false};
 };
 
-struct ProxyHeader {
-  std::string_view name;
-  std::string_view value;
-};
+using ProxyHeader = ResponseField;
 
 struct ProxyForwarding {
   std::string_view client_address; // numeric address of the downstream peer
@@ -232,7 +249,7 @@ public:
   [[nodiscard]] Result<std::span<const ProxyHeader>>
   on_response_head(Exchange &ex, ApplyCursor &cur, ResponseMeta meta,
                    std::span<const ProxyHeader> input,
-                   std::span<ProxyHeader> output) noexcept;
+                   std::span<ProxyHeader> output, bool tunnel = false) noexcept;
 
   // After on_response_head, claim body credit before reading or decoding
   // upstream data. Blocked waits for ResWritable or a pending read completion.
@@ -243,7 +260,8 @@ public:
   // after a framing-only read. end means the decoder saw the message end.
   [[nodiscard]] Result<> on_read(Exchange &ex, ApplyCursor &cur,
                                  Result<std::span<const std::byte>> completion,
-                                 bool end) const noexcept;
+                                 bool end,
+                                 std::span<const ResponseField> trailers = {}) const noexcept;
 
   // true authorizes another attempt with the same responder and Exchange.
   // Use IfUnsent only if no upstream request bytes were written, all old

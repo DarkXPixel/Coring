@@ -1,4 +1,5 @@
 #include "coring5/proto/http1session/ServerSession.hpp"
+#include "coring5/http/Handlers.hpp"
 #include "coring5/proto/http1/Parser.hpp"
 #include "coring5/proto/http1/ResponseWriter.hpp"
 #include <algorithm>
@@ -25,6 +26,31 @@ namespace {
   return true;
 }
 
+bool accepts_trailers(const RequestHead &head) noexcept {
+  const auto options = std::span(head.connection_tokens).first(head.connection_token_count);
+  if (head.minor_version != 1 ||
+      std::ranges::none_of(options, [](auto name) { return ieq(name, "te"); })) {
+    return false;
+  }
+  for (const auto &field : std::span(head.headers).first(head.header_count)) {
+    if (!field.named("te")) {
+      continue;
+    }
+    auto list = field.value;
+    while (!list.empty()) {
+      const auto comma = list.find(',');
+      const auto item = list.substr(0, comma);
+      const auto first = item.find_first_not_of(" \t");
+      if (first != item.npos &&
+          ieq(item.substr(first, item.find_last_not_of(" \t") - first + 1), "trailers")) {
+        return true;
+      }
+      list = comma == list.npos ? std::string_view{} : list.substr(comma + 1);
+    }
+  }
+  return false;
+}
+
 [[nodiscard]] uint16_t status_of(ParseError e) noexcept {
   switch (e) {
   case ParseError::HeadTooLarge:
@@ -45,9 +71,10 @@ namespace {
 
 ServerSession::ServerSession(ExchangePool &exchanges, ChunkPool &stage,
                              const Limits &limits, uint32_t buffer_size,
-                             SideRef self) noexcept
+                             SideRef self, RequestObserver observer) noexcept
     : pool_(&exchanges), chunks_(&stage), limits_(limits),
-      buffer_size_(buffer_size), cap_(stage.chunk_size()), self_(self) {
+      buffer_size_(buffer_size), cap_(stage.chunk_size()), self_(self),
+      observer_(observer) {
   assert(cap_ >= limits.max_head_bytes + buffer_size);
   refresh();
 }
@@ -197,6 +224,29 @@ std::size_t ServerSession::run_body(std::span<const char> buf) noexcept {
       expect_ = false;
     }
     const auto rest = buf.subspan(pos);
+    if (mode_ == Mode::Tunnel) {
+      if (held_ == 0) {
+        const auto want = static_cast<uint32_t>(std::min<std::size_t>(rest.size(), buffer_size_));
+        const auto credit = claim_credit(*ex, want);
+        if (credit == ClaimStatus::Blocked) {
+          rx_ = RxState::BodyBlocked;
+          return pos;
+        }
+        if (credit == ClaimStatus::Closed) {
+          stop_rx();
+          return buf.size();
+        }
+      }
+      const auto n = std::min<std::size_t>(rest.size(), held_);
+      held_ = 0;
+      if (ex->push(StreamId::Req, std::as_bytes(rest.first(n))) != WriteStatus::Ok) {
+        fail_hard(ex->stream(StreamId::Req).aborted_with());
+        return buf.size();
+      }
+      pos += n;
+      outcome_.bytes_in += n;
+      continue;
+    }
     if (body_kind_ == BodyKind::ContentLength) {
       if (held_ == 0) {
         const auto want = static_cast<uint32_t>(
@@ -213,6 +263,7 @@ std::size_t ServerSession::run_body(std::span<const char> buf) noexcept {
       }
       const std::size_t n = cl_.take(std::min<std::size_t>(rest.size(), held_));
       pos += n;
+      outcome_.bytes_in += n;
       held_ = 0; // push settles the claim
       if (!push_ok(ex->push(StreamId::Req, std::as_bytes(rest.first(n))))) {
         return buf.size();
@@ -226,6 +277,7 @@ std::size_t ServerSession::run_body(std::span<const char> buf) noexcept {
     // chunked
     const ChunkedStep step = dec_.feed(rest, held_);
     pos += step.consumed;
+    outcome_.bytes_in += step.consumed;
     switch (step.event) {
     case ChunkedEvent::NeedMore:
       break;
@@ -258,9 +310,15 @@ std::size_t ServerSession::run_body(std::span<const char> buf) noexcept {
       }
       break;
     case ChunkedEvent::Done:
+      if (observer_.on_trailers && dec_.trailers_seen() != 0) {
+        observer_.on_trailers(observer_.context, 0, dec_.trailers_seen(), false);
+      }
       body_complete(*ex);
       return pos;
     case ChunkedEvent::Error:
+      if (observer_.on_trailers && is_trailer_error(step.reason)) {
+        observer_.on_trailers(observer_.context, 0, 0, true);
+      }
       body_failed(step.error == Errc::TooLarge ? Errc::TooLarge
                                                : Errc::ProtocolViolation,
                   step.error == Errc::TooLarge ? 413 : 400);
@@ -314,6 +372,7 @@ void ServerSession::handle_head(const RequestHead &h,
   meta.declared_known = plan.kind == BodyKind::ContentLength;
   meta.declared = plan.length;
   meta.accepts_interim = req_minor_ >= 1;
+  meta.client_accepts_trailers = accepts_trailers(h);
   const Handle ex = pool_->open(self_, meta);
   if (!ex.valid()) {
     static_error(503, Errc::Overloaded);
@@ -321,6 +380,9 @@ void ServerSession::handle_head(const RequestHead &h,
   }
   ex_ = ex;
   fresh_ = ex;
+  if (observer_.on_head) {
+    observer_.on_head(observer_.context, h);
+  }
   body_kind_ = plan.kind;
   if (plan.kind == BodyKind::ContentLength) {
     cl_.start(plan.length);
@@ -344,6 +406,13 @@ std::size_t ServerSession::pump(std::span<const char> buf) noexcept {
     switch (rx_) {
     case RxState::Idle:
       rx_ = RxState::Head;
+      if (observer_.on_complete) {
+        outcome_ = {};
+        observing_request_ = true;
+        if (observer_.on_begin) {
+          observer_.on_begin(observer_.context);
+        }
+      }
       [[fallthrough]];
     case RxState::Head: {
       RequestHead head;
@@ -362,6 +431,10 @@ std::size_t ServerSession::pump(std::span<const char> buf) noexcept {
       }
       const std::size_t tail = buf.size() - pos - r.consumed;
       pos += r.consumed;
+      outcome_.bytes_in = r.consumed;
+      if (observer_.on_parsed) {
+        observer_.on_parsed(observer_.context, head);
+      }
       handle_head(head, tail);
       if (rx_ == RxState::Stopped) {
         return buf.size();
@@ -488,7 +561,9 @@ void ServerSession::on_eof(Errc why) noexcept {
   case RxState::ExpectWait:
   case RxState::Body:
   case RxState::BodyBlocked:
-    fail_hard(why == Errc::Eof ? Errc::ProtocolViolation : why);
+    fail_hard(why == Errc::Eof && mode_ != Mode::Tunnel
+                  ? Errc::ProtocolViolation
+                  : why);
     break;
   case RxState::Held:
   case RxState::Stopped:
@@ -535,22 +610,13 @@ void ServerSession::on_exchange_events() noexcept {
     const uint16_t st = ex->take_interim();
     if (st == 100 && expect_ && rx_ == RxState::ExpectWait &&
         tx_ == TxState::Idle && !output_pending() && !ex->head_published() &&
+        ex->stream(StreamId::Res).state() == StreamState::Open &&
         begin_out() && kContinue100.size() <= cap_) {
       std::memcpy(out_ptr(), kContinue100.data(), kContinue100.size());
       out_len_ = static_cast<uint32_t>(kContinue100.size());
       out_off_ = 0;
       tx_ = TxState::Interim;
       expect_ = false;
-    }
-  }
-  if (!hard_ && tx_ == TxState::Idle && !ex->head_published() &&
-      ((ev & ExEvent::kPeerDetached) != 0 ||
-       (ev & ExEvent::kResAborted) != 0)) {
-    const StreamState rs = ex->stream(StreamId::Res).state();
-    if (ex->phase() == Phase::Closing || rs == StreamState::Aborted) {
-      const Errc e = ex->stream(StreamId::Res).aborted_with();
-      static_error(status_for(e == Errc::Ok ? Errc::Internal : e),
-                   e == Errc::Ok ? Errc::Internal : e);
     }
   }
   tx_pump();
@@ -595,6 +661,7 @@ void ServerSession::static_error(uint16_t status, Errc why) noexcept {
     return;
   }
   out_len_ += static_cast<uint32_t>(w.size());
+  outcome_.status = status;
   close_why_ = why;
   error_close_ = true;
   want_close_ = true;
@@ -607,25 +674,29 @@ void ServerSession::static_error(uint16_t status, Errc why) noexcept {
 
 void ServerSession::build_head(Exchange &ex) noexcept {
   const ResponseMeta m = ex.response_meta();
+  const auto fields = ex.take_response_fields();
   const BodyStream &rs = ex.stream(StreamId::Res);
   if (rs.state() == StreamState::Aborted && !m.synthesized) {
     const Errc e = rs.aborted_with();
     static_error(status_for(e), e);
     return;
   }
+  const bool tunnel = ex.tunneling();
   const bool forbidden = content_forbidden(m.status, head_only_);
   bool send_cl = false;
   uint64_t cl = 0;
-  if (forbidden) {
+  if (tunnel) {
+    mode_ = Mode::Tunnel;
+  } else if (forbidden) {
     mode_ = Mode::None;
     if (head_only_ && m.declared_known && m.status >= 200 && m.status != 204 &&
         m.status != 304) {
       send_cl = true;
       cl = m.declared;
     }
-  } else if (m.declared_known) {
+  } else if (m.no_content || m.declared_known) {
     send_cl = true;
-    cl = m.declared;
+    cl = m.no_content ? 0 : m.declared;
     mode_ = cl > 0 ? Mode::Length : Mode::None;
     tx_left_ = cl;
   } else if (req_minor_ >= 1) {
@@ -644,7 +715,7 @@ void ServerSession::build_head(Exchange &ex) noexcept {
   k.limit_reached =
       limits_.max_requests != 0 && served_ >= limits_.max_requests;
   k.errored = error_close_ || peer_eof_;
-  keep_ = keep_alive_after(k);
+  keep_ = !tunnel && keep_alive_after(k);
   if (incomplete) {
     // Early final response: stop reading the body and close afterwards.
     release_credit();
@@ -655,22 +726,33 @@ void ServerSession::build_head(Exchange &ex) noexcept {
 
   ResponseWriter w(std::span<char>(out_ptr(), cap_));
   (void)w.status_line(m.status, 1);
+  for (const ResponseField &field : fields) {
+    if (forbidden_static_header(field.name)) {
+      static_error(500, Errc::Internal);
+      return;
+    }
+    (void)w.header(field.name, field.value);
+  }
   if (mode_ == Mode::Chunked) {
     (void)w.chunked();
   } else if (send_cl) {
     (void)w.content_length(cl);
   }
   const std::string_view tok = connection_token(keep_, req_minor_);
-  if (!tok.empty()) {
+  if (tunnel) {
+    (void)w.header("Connection", "Upgrade");
+    (void)w.header("Upgrade", "websocket");
+  } else if (!tok.empty()) {
     (void)w.header("Connection", tok);
   }
   (void)w.end_head();
   if (w.error() != Errc::Ok) {
-    fail_hard(Errc::Internal);
+    static_error(500, w.error());
     return;
   }
   out_off_ = 0;
   out_len_ = static_cast<uint32_t>(w.size());
+  outcome_.status = m.status;
 
   if (mode_ == Mode::Length) { // coalesce a small, already complete body
     const auto f = ex.front(StreamId::Res);
@@ -683,6 +765,10 @@ void ServerSession::build_head(Exchange &ex) noexcept {
     }
   }
   tx_ = TxState::Head;
+  if (tunnel) {
+    rx_ = RxState::Body;
+    run_stage();
+  }
 }
 
 void ServerSession::res_failed() noexcept {
@@ -698,13 +784,24 @@ void ServerSession::res_failed() noexcept {
 void ServerSession::tx_pump() noexcept {
   for (;;) {
     Exchange *ex = cur();
-    if (ex == nullptr || hard_ || output_pending()) {
+    if (ex == nullptr || hard_ || payload_out_ || output_pending()) {
       return;
     }
     out_off_ = out_len_ = 0;
     switch (tx_) {
     case TxState::Idle:
-      if (!ex->head_published() || !begin_out()) {
+      if (!ex->head_published()) {
+        // The failure event may have arrived while an interim send was pending.
+        const auto &res = ex->stream(StreamId::Res);
+        if (res.state() == StreamState::Aborted ||
+            ex->phase() == Phase::Closing) {
+          const Errc e = res.aborted_with();
+          const Errc why = e == Errc::Ok ? Errc::Internal : e;
+          static_error(status_for(why), why);
+        }
+        return;
+      }
+      if (!begin_out()) {
         return;
       }
       build_head(*ex);
@@ -727,6 +824,7 @@ void ServerSession::tx_pump() noexcept {
         tx_ = TxState::ChunkHdr;
         break;
       case Mode::CloseDelimited:
+      case Mode::Tunnel:
         tx_ = TxState::Payload;
         break;
       }
@@ -740,10 +838,30 @@ void ServerSession::tx_pump() noexcept {
             res_failed();
             return;
           }
-          auto n = write_last_chunk({out_ptr(), cap_});
+          const auto trailers = ex->response_trailers();
+          std::array<FieldView, kMaxHeadersHard> fields;
+          if (trailers.size() > fields.size() ||
+              std::ranges::any_of(trailers, [](auto field) {
+                return forbidden_static_header(field.name);
+              })) {
+            if (observer_.on_trailers) {
+              observer_.on_trailers(observer_.context, 0, 0, true);
+            }
+            res_failed();
+            return;
+          }
+          std::ranges::transform(trailers, fields.begin(), [](auto field) {
+            return FieldView{field.name, field.value};
+          });
+          auto n = write_last_chunk({out_ptr(), cap_},
+                                    std::span(fields).first(trailers.size()));
           if (!n) {
             fail_hard(Errc::Internal);
             return;
+          }
+          if (observer_.on_trailers && !trailers.empty()) {
+            observer_.on_trailers(observer_.context,
+                                  static_cast<uint32_t>(trailers.size()), 0, false);
           }
           out_len_ = static_cast<uint32_t>(*n);
           tx_ = TxState::End;
@@ -766,7 +884,8 @@ void ServerSession::tx_pump() noexcept {
       }
       const BodyStream &rs = ex->stream(StreamId::Res);
       if (rs.end_seen()) {
-        if (rs.aborted_with() != Errc::Ok || mode_ != Mode::CloseDelimited) {
+        if (rs.aborted_with() != Errc::Ok ||
+            (mode_ != Mode::CloseDelimited && mode_ != Mode::Tunnel)) {
           res_failed();
           return;
         }
@@ -790,6 +909,7 @@ void ServerSession::tx_pump() noexcept {
 }
 
 void ServerSession::finish_cycle() noexcept {
+  complete_request();
   const bool keep = keep_ && !error_close_ && !drain_ && !peer_eof_;
   drop_exchange(Errc::Ok);
   if (out_idx_ != ChunkPool::kNil) {
@@ -829,7 +949,11 @@ std::span<const std::byte> ServerSession::next_send() noexcept {
       if (n > 0) {
         send_src_ = 1;
         payload_out_ = true;
-        r = f.first(n);
+        // An asynchronous producer can abort the stream and recycle its chunks
+        // while this send is pending. The session output slot lives to the CQE.
+        n = std::min<std::size_t>(n, cap_);
+        std::memcpy(out_ptr(), f.data(), n);
+        r = {chunks_->data(out_idx_), n};
       }
     }
   }
@@ -839,6 +963,7 @@ std::span<const std::byte> ServerSession::next_send() noexcept {
 
 void ServerSession::on_sent(uint32_t n) noexcept {
   progress_ = true;
+  outcome_.bytes_out += n;
   if (hard_) {
     payload_out_ = false;
     return;
@@ -851,6 +976,11 @@ void ServerSession::on_sent(uint32_t n) noexcept {
   } else {
     payload_out_ = false;
     if (Exchange *ex = cur()) {
+      if (ex->stream(StreamId::Res).state() == StreamState::Aborted) {
+        res_failed();
+        refresh();
+        return;
+      }
       ex->consume(StreamId::Res, n);
       if (mode_ == Mode::Chunked) {
         pl_ -= std::min(pl_, n);
@@ -868,6 +998,9 @@ void ServerSession::on_sent(uint32_t n) noexcept {
       }
     }
   }
+  if (tx_ == TxState::Done && !output_pending()) {
+    complete_request(); // static error responses have no exchange to pump
+  }
   tx_pump();
   refresh();
 }
@@ -880,6 +1013,11 @@ void ServerSession::drop_exchange(Errc why) noexcept {
   release_credit();
   if (ex != nullptr) {
     ex->detach(Side::Ingress, why);
+    // Anonymous responders are local producers owned by this session.
+    if (ex->responder_state() == Exchange::ResponderState::Attached &&
+        !ex->responder().conn.handle.valid()) {
+      ex->detach(Side::Responder, why);
+    }
   }
   ex_ = {};
 }
@@ -895,14 +1033,15 @@ void ServerSession::fail_hard(Errc why) noexcept {
   tx_ = TxState::Done;
   expect_ = false;
   clear_stage();
-  // A payload send may still read front(Res): the connection calls release()
-  // after inflight == 0 in that case.
+  // A pending payload CQE still belongs to this exchange. release() settles
+  // its lifetime when the connection has drained its operations.
   if (!payload_out_) {
     drop_exchange(why);
   }
 }
 
 void ServerSession::release() noexcept {
+  complete_request();
   payload_out_ = false;
   drop_exchange(Errc::Shutdown);
   clear_stage();
@@ -912,6 +1051,13 @@ void ServerSession::release() noexcept {
   }
   out_off_ = out_len_ = 0;
   held_ = 0;
+}
+
+void ServerSession::complete_request() noexcept {
+  if (observing_request_) {
+    observing_request_ = false;
+    observer_.on_complete(observer_.context, outcome_);
+  }
 }
 
 void ServerSession::on_drain() noexcept {

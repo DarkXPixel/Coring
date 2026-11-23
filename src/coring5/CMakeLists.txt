@@ -40,13 +40,13 @@ coring5_module(base SOURCES base/Endpoint.cpp)
 coring5_module(mem  SOURCES mem/Region.cpp mem/ChunkPool.cpp mem/ChunkQueue.cpp DEPS base)
 
 # ---- no kernel ring needed (testable anywhere) --------------------------------
-coring5_module(config SOURCES config/Loader.cpp config/Diff.cpp DEPS base)
+coring5_module(config SOURCES config/Loader.cpp config/Diff.cpp config/Routes.cpp config/RouteLoader.cpp DEPS base)
 find_package(tomlplusplus QUIET)
 if(tomlplusplus_FOUND)
   target_link_libraries(coring5_config PUBLIC tomlplusplus::tomlplusplus)
 endif()                     # else: <toml++/toml.hpp> from the system include path
 
-coring5_module(obs SOURCES obs/Metrics.cpp DEPS base)
+coring5_module(obs SOURCES obs/Metrics.cpp obs/AccessLogWriter.cpp DEPS base SYSTEM_DEPS Threads::Threads)
 
 # Sans-IO HTTP building blocks (BodyStream, Exchange, ExchangePool).
 # Deliberately NO dependency on io: testable and fuzzable without a kernel ring.
@@ -61,7 +61,7 @@ coring5_module(io
   DEPS base mem config obs
   SYSTEM_DEPS PkgConfig::LIBURING)
 coring5_module(upstream SOURCES upstream/UpstreamPool.cpp DEPS base config)
-coring5_module(net SOURCES net/ListenSocket.cpp net/UpstreamDialer.cpp DEPS base io upstream)
+coring5_module(net SOURCES net/IdleUpstreams.cpp net/ListenSocket.cpp net/UpstreamDialer.cpp DEPS base io upstream)
 
 # ---- protocols (sans-IO where possible) ---------------------------------------
 coring5_module(proto_http1 SOURCES proto/http1/Parser.cpp proto/http1/ChunkedDecoder.cpp proto/http1/ResponseWriter.cpp DEPS base config)
@@ -70,15 +70,17 @@ coring5_module(proto_http1session SOURCES proto/http1session/ServerSession.cpp
 coring5_module(proto_l4
   SOURCES proto/l4/EchoConn.cpp proto/l4/L4Conn.cpp
   DEPS io net upstream)
+coring5_module(handlers SOURCES handlers/StaticFileRoot.cpp
+                    DEPS http io proto_http1 upstream)
 # Connection types per protocol (depend on io). proto_http1 stays sans-IO.
-coring5_module(proto_http1conn SOURCES proto/http1conn/Http1Conn.cpp
-                    DEPS io mem http proto_http1 proto_http1session)
+coring5_module(proto_http1conn
+  SOURCES proto/http1conn/Http1Conn.cpp proto/http1conn/FileResponder.cpp
+          proto/http1conn/ProxyResponder.cpp
+  DEPS io mem obs http handlers net proto_http1 proto_http1session)
 coring5_module(proto_http2 SOURCES proto/http2/Http2Conn.cpp DEPS io)
 coring5_module(proto_http3 SOURCES proto/http3/Http3Conn.cpp DEPS io)
 
 coring5_module(tls)         # interface-only until M5
-coring5_module(handlers SOURCES handlers/StaticFileRoot.cpp
-                    DEPS http io proto_http1 upstream)
 
 # ---- runtime + control --------------------------------------------------------
 coring5_module(control SOURCES control/ControlServer.cpp SYSTEM_DEPS Threads::Threads)
@@ -86,7 +88,7 @@ coring5_module(runtime
   SOURCES
     runtime/Mailbox.cpp runtime/Worker.cpp runtime/WorkerGroup.cpp
     runtime/ConfigManager.cpp runtime/Daemon.cpp
-  DEPS io net upstream http proto_l4 proto_http1conn proto_http2 proto_http3 control config obs
+  DEPS handlers io net upstream http proto_l4 proto_http1conn proto_http2 proto_http3 control config obs
   SYSTEM_DEPS Threads::Threads)
 
 # ---- applications ----------------------------------------------------------------

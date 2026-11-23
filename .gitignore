@@ -70,4 +70,7 @@ Testing/
 .vscode/
 .aider*
 .zed/
-.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/coring5.yml

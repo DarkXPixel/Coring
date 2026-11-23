@@ -49,7 +49,12 @@ struct BackendRef {
 
 class UpstreamPool {
 public:
-  // Worker thread, on ApplyConfig. May allocate (cold path).
+  // Prepare allocates on the control thread. Install preserves live accounting
+  // for unchanged backends and swaps preallocated entries on the worker.
+  [[nodiscard]] static UpstreamPool prepare(const ConfigSnapshot &snapshot);
+  void install(UpstreamPool &prepared) noexcept;
+  // Convenience for standalone pools.
+
   void apply_config(const ConfigSnapshot &snapshot);
 
   // `exclude`: backend indexes this connection already tried.

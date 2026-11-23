@@ -85,6 +85,10 @@ struct alignas(64) WorkerMetrics {
   Counter cq_overflow{0};
   Counter bytes_in{0};
   Counter bytes_out{0};
+  Counter trailers_forwarded{0}; // fields serialized downstream
+  Counter trailers_dropped{0};   // valid fields suppressed by policy
+  Counter trailers_rejected{0};  // invalid trailer blocks
+  Counter access_log_dropped{0}; // this worker's access-log ring was full
   Counter loop_iterations{0};
   Counter cqes{0};
   Counter buffers_free{0}; // gauge

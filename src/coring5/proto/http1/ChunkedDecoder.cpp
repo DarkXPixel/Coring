@@ -147,9 +147,16 @@ ChunkedStep ChunkedDecoder::feed(std::span<const char> in,
     if (in_ext && ++ext_bytes_ > max_ext_bytes_) {
       return bad(ChunkedReason::ExtTooLarge, i);
     }
-    if (st_ >= St::TrStart && st_ <= St::EndLf &&
-        ++trailer_bytes_ > max_trailer_bytes_) {
-      return bad(ChunkedReason::TrailersTooLarge, i);
+    if (st_ >= St::TrStart && st_ <= St::EndLf) {
+      if (++trailer_bytes_ > max_trailer_bytes_) {
+        return bad(ChunkedReason::TrailersTooLarge, i);
+      }
+      if (!trailer_storage_.empty()) {
+        if (trailer_bytes_ > trailer_storage_.size()) {
+          return bad(ChunkedReason::TrailersTooLarge, i);
+        }
+        trailer_storage_[trailer_bytes_ - 1] = in[i];
+      }
     }
 
     switch (st_) {

@@ -1,6 +1,7 @@
 #include "coring5/runtime/ConfigManager.hpp"
 
 #include "coring5/net/ListenSocket.hpp"
+#include "coring5/handlers/StaticFileRoot.hpp"
 #include <format>
 
 namespace Coring5 {
@@ -10,18 +11,48 @@ std::shared_ptr<const ConfigSnapshot> ConfigManager::current() const {
   return current_;
 }
 
+void ConfigManager::retire_route_text(
+    const std::shared_ptr<const ConfigSnapshot> &old) {
+  std::erase_if(retired_text_,
+                [](const auto &text) { return text.use_count() == 1; });
+  if (!old) {
+    return;
+  }
+  // On an ack timeout a worker may still start a response from this snapshot.
+  const bool snapshot_in_use = old.use_count() > 1;
+  const auto retain = [this, snapshot_in_use](const auto &text) {
+    if (text && (snapshot_in_use || text.use_count() > 1)) {
+      retired_text_.insert(text);
+    }
+  };
+  for (const auto &[name, set] : old->routes) {
+    for (const auto &host : set.vhosts) {
+      for (const auto *paths : {&host.exact, &host.prefix}) {
+        for (const auto &[path, action] : *paths) {
+          if (const auto *respond = std::get_if<RespondRoute>(&action)) {
+            retain(respond->text);
+          } else if (const auto *redirect = std::get_if<RedirectRoute>(&action)) {
+            retain(redirect->text);
+          }
+        }
+      }
+    }
+  }
+}
+
 std::expected<ReloadReport, std::string>
 ConfigManager::apply(ParsedConfig parsed) {
   std::lock_guard lock(mtx_);
 
-  // 1-2. validate; the runtime section is fixed for the process lifetime.
+  // 1-2. Validate and check settings fixed for the process lifetime.
   if (auto v = validate_config(parsed); !v) {
     return std::unexpected(std::move(v.error()));
   }
   if (have_runtime_ && !(parsed.runtime == runtime_)) {
-    return std::unexpected(
-        "the [runtime] section changed: restart required (hot reload covers "
-        "[limits] and [[listener]] only)");
+    return std::unexpected("the [runtime] section changed: restart required");
+  }
+  if (have_runtime_ && parsed.access_log != access_log_) {
+    return std::unexpected("the [access_log] section changed: restart required");
   }
   if (have_runtime_ &&
       static_cast<uint64_t>(parsed.limits.max_head_bytes) +
@@ -62,6 +93,7 @@ ConfigManager::apply(ParsedConfig parsed) {
     u.id = prev != nullptr ? prev->id : UpstreamId{next_upstream_id_++};
     next->upstreams.push_back(std::move(u));
   }
+  next->install_routes(std::move(parsed.routes));
   for (auto &spec : parsed.listeners) {
     if (!spec.upstream.empty()) {
       for (const auto &u :
@@ -81,6 +113,10 @@ ConfigManager::apply(ParsedConfig parsed) {
       }
     }
     spec.id = prev != nullptr ? prev->id : ListenerId{next_listener_id_++};
+    if (prev != nullptr) {
+      // A kept socket retains its bound endpoint, including an ephemeral port.
+      spec.endpoint = prev->endpoint;
+    }
     next->listeners.push_back(std::move(spec));
   }
   next->generation = next_generation_;
@@ -93,7 +129,29 @@ ConfigManager::apply(ParsedConfig parsed) {
   const std::size_t n = workers_.size();
   std::vector<ApplyConfig> msgs(n);
   auto ack = std::make_shared<ReloadAck>(static_cast<uint32_t>(n));
+  auto roots = std::make_shared<StaticRoots>();
+  for (const auto &[name, set] : next->routes) {
+    for (const auto &host : set.vhosts) {
+      for (const auto *paths : {&host.exact, &host.prefix}) {
+        for (const auto &[path, action] : *paths) {
+          const auto *file = std::get_if<StaticRoute>(&action);
+          if (!file || roots->directories.contains(file->root)) {
+            continue;
+          }
+          auto root = StaticFileRoot::open(file->root);
+          if (!root) {
+            return std::unexpected(
+                std::format("static root '{}': open failed (errno {})",
+                            file->root, root.error().sys));
+          }
+          roots->directories.emplace(file->root, std::move(*root));
+        }
+      }
+    }
+  }
   for (auto &m : msgs) {
+    m.roots = roots;
+    m.upstreams = UpstreamPool::prepare(*next);
     m.snapshot = next;
     m.remove = diff.removed;
     m.ack = ack;
@@ -104,6 +162,10 @@ ConfigManager::apply(ParsedConfig parsed) {
       if (l.id == id) {
         spec = &l;
       }
+    }
+    if (spec == nullptr) {
+      return std::unexpected(
+          std::format("no listener spec for newly added id {}", id.value));
     }
     Endpoint ep = spec->endpoint;
     for (std::size_t w = 0; w < n; ++w) {
@@ -135,11 +197,14 @@ ConfigManager::apply(ParsedConfig parsed) {
   // 8. retire the old snapshot on THIS thread.
   auto old = std::move(current_);
   current_ = std::move(next);
+  current_roots_ = std::move(roots);
   if (!have_runtime_) {
     runtime_ = parsed.runtime; // keeps the pool capacities workers started with
+    access_log_ = std::move(parsed.access_log);
   }
   have_runtime_ = true;
   ++next_generation_;
+  retire_route_text(old);
   old.reset();
 
   if (acked && ack->failures() != 0) {

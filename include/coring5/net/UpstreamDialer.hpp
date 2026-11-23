@@ -54,10 +54,14 @@ public:
   UpstreamDialer &operator=(UpstreamDialer &&) = delete;
   ~UpstreamDialer() = default;
 
+  // The caller may supply a backend it just picked for the first attempt.
   // Pending: a connect is in flight. Failed: nothing is in flight, close the
   // connection with failure(). Never returns Connected (connect is async).
   [[nodiscard]] DialStatus start(IoContext &ctx, ConnCore &core,
-                                 UpstreamPool &pool, UpstreamId upstream);
+                                 UpstreamPool &pool, UpstreamId upstream,
+                                 uint32_t attempt_limit = kMaxAttempts,
+                                 Millis budget_limit = Millis::max(),
+                                 BackendRef first = {});
 
   // For CQEs of kind Connect / LinkTimeout; other kinds are ignored.
   [[nodiscard]] DialStatus on_cqe(IoContext &ctx, ConnCore &core,
@@ -74,7 +78,7 @@ public:
   [[nodiscard]] Millis budget() const noexcept { return budget_; }
 
 private:
-  void attempt(IoContext &ctx, ConnCore &core);
+  void attempt(IoContext &ctx, ConnCore &core, BackendRef first = {});
   void settle(IoContext &ctx, ConnCore &core);
   DialStatus fail(Errc why) noexcept;
 

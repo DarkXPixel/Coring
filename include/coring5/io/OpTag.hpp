@@ -40,6 +40,9 @@ enum class OpKind : uint8_t {
   Splice,
   RecvMsg,
   Shutdown, // IORING_OP_SHUTDOWN (half-close of a relayed stream)
+  Disconnect, // downstream POLLERR/POLLHUP while an HTTP responder is active
+  FileOpen,
+  FileStat,
   Count_    // must stay <= 1 << kOpKindBits (see below)
 };
 

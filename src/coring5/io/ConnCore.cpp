@@ -12,6 +12,14 @@ bool ConnCore::begin_cqe(const Cqe &cqe) noexcept {
   if (!cqe.more()) {
     --inflight_;
   }
+  if (lookup_ == cqe.tag.kind()) {
+    lookup_ = OpKind::Nop;
+  }
+  // An open can win its race with cancellation. No protocol callback runs in
+  // Closing, but the successful CQE has transferred ownership of a real fd.
+  if (closing() && cqe.tag.kind() == OpKind::FileOpen && cqe.res >= 0) {
+    ::close(cqe.res);
+  }
   // In Closing state the lease (if any) is simply recycled by its destructor.
   return cqe.tag.kind() != OpKind::Cancel && !closing();
 }
@@ -43,6 +51,9 @@ void ConnCore::close(IoContext &ctx, Errc why) {
     return;
   }
   // Each cancel has its own CQE and is counted like any other submission (I2).
+  if (lookup_ != OpKind::Nop) {
+    (void)counted(ctx.ring.cancel_tag(tag(lookup_), tag(OpKind::Cancel)));
+  }
   cancel_side(ctx, fd_.get(), kAuxConnection);
   if (peer_.valid()) {
     cancel_side(ctx, peer_.get(), kAuxPeer);

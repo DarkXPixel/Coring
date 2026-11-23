@@ -167,6 +167,7 @@ TEST(Exchange, E7StatusMapping) {
   EXPECT_EQ(status_for(Errc::Timeout), 504);
   EXPECT_EQ(status_for(Errc::UpstreamUnavailable), 503);
   EXPECT_EQ(status_for(Errc::Overloaded), 503);
+  EXPECT_EQ(status_for(Errc::Shutdown), 503);
   EXPECT_EQ(status_for(Errc::Reset), 502);
   EXPECT_EQ(status_for(Errc::ProtocolViolation), 502);
   EXPECT_EQ(status_for(Errc::Internal), 502);

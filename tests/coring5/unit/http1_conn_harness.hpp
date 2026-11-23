@@ -21,6 +21,7 @@
 #include "coring5/obs/Metrics.hpp"
 #include "coring5/proto/http1conn/Http1Conn.hpp"
 #include "coring5/runtime/ExchangeDelivery.hpp"
+#include <array>
 #include <cerrno>
 #include <cstdint>
 #include <gtest/gtest.h>
@@ -40,6 +41,7 @@ inline constexpr uint32_t kLow = 16;      // BodyStream low watermark
 inline constexpr uint32_t kBuffer = 64;   // "socket" buffer size
 inline constexpr uint32_t kMaxHead = 512; // head limit
 inline constexpr uint32_t kStageChunk = kMaxHead + kBuffer;
+inline constexpr ListenerId kHttpListener{23};
 
 // One Http1Conn wired to the fake ring, plus the worker-side services it needs.
 struct ConnHarness {
@@ -52,9 +54,11 @@ struct ConnHarness {
   }
 
   explicit ConnHarness(uint32_t exchange_cap = 8, uint32_t stage_chunks = 8,
-                       Limits limits = base_limits())
+                       Limits limits = base_limits(),
+                       const ConfigSnapshot *snapshot = nullptr,
+                       uint32_t stage_size = kStageChunk, FdOwner ingress = {})
       : limits_(limits), buffers_(64, kBuffer) {
-    auto sp = ChunkPool::create(kStageChunk, stage_chunks);
+    auto sp = ChunkPool::create(stage_size, stage_chunks);
     EXPECT_TRUE(sp);
     stage_ = std::move(*sp);
     auto bp = ChunkPool::create(kChunk, 256);
@@ -67,11 +71,18 @@ struct ConnHarness {
         ring_, buffers_, *timers_, metrics_, &limits_, Clock::now(), {}});
     ctx_->exchanges = exchanges_.get();
     ctx_->stage = &stage_;
+    ctx_->chunks = &chunk_pool_;
+    ctx_->snapshot = snapshot;
+    ctx_->accepted.listener = kHttpListener;
+    ctx_->route_scratch = route_scratch_;
 
-    int fds[2];
-    EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-    peer_fd_ = fds[1];
-    conn_ = std::make_unique<Http1Conn>(FdOwner{fds[0]});
+    if (!ingress) {
+      int fds[2];
+      EXPECT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+      peer_fd_ = fds[1];
+      ingress.reset(fds[0]);
+    }
+    conn_ = std::make_unique<Http1Conn>(std::move(ingress));
     conn_->core.bind(ConnRef{PoolId::Http1, Handle{1, 1}});
     conn_->start(*ctx_);
     reconcile(); // fold the initial recv into outstanding_
@@ -139,7 +150,7 @@ struct ConnHarness {
 
   // Deliver a CQE for one specific recorded submission (unambiguous even when
   // several submissions share a tag, e.g. successive sends on one connection).
-  void deliver_op(const Outstanding &s, int32_t res,
+  void deliver_op(Outstanding s, int32_t res,
                   IoBufferRing::Lease &&lease = {}) {
     for (auto it = outstanding_.begin(); it != outstanding_.end(); ++it) {
       if (it->id == s.id) {
@@ -212,7 +223,7 @@ struct ConnHarness {
       if (conn_->core.state() == ConnCore::State::Closed) {
         return;
       }
-      if (s.kind == OpKind::Recv || s.kind == OpKind::Send) {
+      if (s.kind != OpKind::Cancel) {
         deliver_op(s, -ECANCELED);
       }
     }
@@ -306,6 +317,7 @@ struct ConnHarness {
   FakeBufferRing buffers_;
   WorkerMetrics metrics_{};
   ChunkPool stage_;
+  std::array<char, kMaxHead> route_scratch_{};
   ChunkPool chunk_pool_;
   std::unique_ptr<ExchangePool> exchanges_;
   std::unique_ptr<TimerWheel> timers_;

@@ -7,6 +7,7 @@
 // failing worker is returned: no half-started process.
 
 #include "coring5/config/Snapshot.hpp"
+#include "coring5/obs/AccessLog.hpp"
 #include "coring5/obs/Metrics.hpp"
 #include "coring5/runtime/Mailbox.hpp"
 #include "coring5/runtime/Worker.hpp"
@@ -26,7 +27,9 @@ public:
   WorkerGroup &operator=(const WorkerGroup &) = delete;
   ~WorkerGroup();
 
-  [[nodiscard]] std::expected<void, std::string> start(const RuntimeConfig &rt);
+  // Optional rings must outlive all workers, with one ring per worker.
+  [[nodiscard]] std::expected<void, std::string>
+  start(const RuntimeConfig &rt, std::span<AccessLogRing> access_logs = {});
 
   // Graceful: stop accepting, drain connections up to `drain_timeout`, join.
   void shutdown(Millis drain_timeout);

@@ -5,10 +5,12 @@
 
 #include "coring5/runtime/ConfigManager.hpp"
 #include "coring5/control/ControlServer.hpp"
+#include "coring5/obs/AccessLogWriter.hpp"
 #include "coring5/runtime/WorkerGroup.hpp"
 #include <atomic>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 
 namespace Coring5 {
@@ -32,11 +34,14 @@ public:
   [[nodiscard]] bool stop_requested() const noexcept {
     return stop_requested_.load();
   }
-  void stop();
+  [[nodiscard]] Result<> stop();
 
 private:
   DaemonOptions opts_;
   std::atomic<bool> stop_requested_{false};
+  // Workers must quiesce before the writer stops, and both borrow the rings.
+  std::unique_ptr<AccessLogRing[]> access_logs_;
+  std::optional<AccessLogWriter> access_writer_;
   WorkerGroup workers_;
   std::unique_ptr<ConfigManager> config_;
   std::unique_ptr<ControlServer> control_;

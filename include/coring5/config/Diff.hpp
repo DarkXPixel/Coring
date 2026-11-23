@@ -13,10 +13,11 @@ struct ConfigDiff {
   std::vector<ListenerId> kept;
   bool limits_changed{false};
   bool upstreams_changed{false};
+  bool routes_changed{false};
 
   [[nodiscard]] bool empty() const noexcept {
     return added.empty() && removed.empty() && !limits_changed &&
-           !upstreams_changed;
+           !upstreams_changed && !routes_changed;
   }
 };
 

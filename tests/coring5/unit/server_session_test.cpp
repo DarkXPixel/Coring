@@ -547,7 +547,11 @@ TEST(ServerSession, FinalHeadBefore100Closes) {
   EXPECT_EQ(h.s().rx(), RxState::ExpectWait);
   // A final head before any 100: no 100 is emitted and the connection closes
   // (the request body was never read).
-  h.respond(*ex, 200, "ok");
+  ASSERT_TRUE(ex->attach_responder(h.responder_));
+  ASSERT_EQ(ex->publish_interim(100), HeadStatus::Ok);
+  ASSERT_EQ(ex->respond_synthetic(200), HeadStatus::Ok);
+  ex->detach(Side::Responder, Errc::Ok);
+  h.settle();
   const std::string out = h.drain_out();
   EXPECT_EQ(out.find("100 Continue"), std::string::npos);
   EXPECT_NE(out.find("HTTP/1.1 200 OK"), std::string::npos);
@@ -563,6 +567,21 @@ TEST(ServerSession, ResponseContentLength) {
   ASSERT_NE(ex, nullptr);
   h.respond(*ex, 200, "hello");
   EXPECT_EQ(h.drain_out(), "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello");
+}
+
+TEST(ServerSession, ResponseFieldsAndExplicitNoContent) {
+  Harness h;
+  h.feed(req("GET", "/"));
+  Exchange *ex = h.take();
+  ASSERT_NE(ex, nullptr);
+  ASSERT_TRUE(ex->attach_responder(h.responder_));
+  const ResponseField fields[]{{"X-Route", "selected"}, {"ETag", "\"v1\""}};
+  const ResponseMeta meta{.status = 200, .no_content = true};
+  ASSERT_EQ(ex->publish_final(meta, fields), HeadStatus::Ok);
+  ex->detach(Side::Responder, Errc::Ok);
+  h.settle();
+  EXPECT_EQ(h.drain_out(), "HTTP/1.1 200 OK\r\nX-Route: selected\r\n"
+                           "ETag: \"v1\"\r\nContent-Length: 0\r\n\r\n");
 }
 
 TEST(ServerSession, ResponseChunked) {
@@ -634,7 +653,7 @@ TEST(ServerSession, SmallBodyCoalescedIntoOutChunk) {
 
 // ---- response abort --------------------------------------------------------
 
-TEST(ServerSession, ResAbortedBeforeHead502) {
+TEST(ServerSession, ResAbortedBeforeHead503) {
   Harness h;
   h.feed(req("GET", "/"));
   Exchange *ex = h.take();
@@ -645,6 +664,28 @@ TEST(ServerSession, ResAbortedBeforeHead502) {
   const std::string out = h.drain_out();
   EXPECT_NE(out.find("HTTP/1.1 503"), std::string::npos);
   EXPECT_TRUE(h.s().should_close());
+}
+
+TEST(ServerSession, ResponderShutdownDuringContinueSends503) {
+  Harness h;
+  h.feed(req("POST", "/", "Expect: 100-continue\r\nContent-Length: 3\r\n"));
+  Exchange *ex = h.take();
+  ASSERT_NE(ex, nullptr);
+  ASSERT_TRUE(ex->attach_responder(h.responder_));
+  ASSERT_EQ(ex->publish_interim(100), HeadStatus::Ok);
+  h.settle();
+  constexpr std::string_view interim = "HTTP/1.1 100 Continue\r\n\r\n";
+  constexpr uint32_t sent = 8;
+  ASSERT_EQ(as_string(h.s().next_send()), interim);
+  h.s().on_sent(sent);
+  ex->detach(Side::Responder, Errc::Shutdown);
+  h.settle();
+  EXPECT_EQ(h.drain_out(),
+            std::string(interim.substr(sent)) +
+                "HTTP/1.1 503 Service Unavailable\r\n"
+            "Content-Length: 0\r\nConnection: close\r\n\r\n");
+  EXPECT_TRUE(h.s().should_close());
+  EXPECT_EQ(h.pool_->live(), 0U);
 }
 
 TEST(ServerSession, ResAbortedBeforeHeadTimeout504) {

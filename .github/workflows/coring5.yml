@@ -1,0 +1,60 @@
+name: coring5
+
+on:
+  push:
+    paths: ["include/coring5/**", "src/coring5/**", "tests/coring5/**", "cmake/**", "CMakeLists.txt", "CMakePresets.json", "tools/**", "docs/**", ".github/workflows/coring5.yml"]
+  pull_request:
+
+jobs:
+  layering:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/check_layering.py
+
+  build-test:
+    runs-on: ubuntu-24.04     # kernel >= 6.5 on current runner images; io_uring may be restricted
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: debug,      flags: ""}
+          - {name: asan-ubsan, flags: "-fsanitize=address,undefined -fno-omit-frame-pointer -O1 -g"}
+          - {name: tsan,       flags: "-fsanitize=thread -O1 -g"}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake liburing-dev libgtest-dev libtomlplusplus-dev pkg-config g++-14
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DCORING5_BUILD_TESTS=ON -DCORING5_WERROR=ON -DCORING_BUILD_LEGACY=OFF -DCMAKE_CXX_COMPILER=g++-14
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF
+          -DCMAKE_CXX_FLAGS="${{ matrix.flags }}" -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.flags }}"
+      - run: cmake --build build
+      - name: Unit tests
+        run: ctest --test-dir build --no-tests=error -L unit --output-on-failure --timeout 120
+      - name: Integration tests (skip themselves when io_uring is unavailable)
+        run: ctest --test-dir build --no-tests=error -L uring --output-on-failure --timeout 120
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build cmake liburing-dev libgtest-dev libtomlplusplus-dev pkg-config clang-19 libclang-rt-19-dev g++-14
+      - run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+          -DCORING5_BUILD_TESTS=ON -DCORING5_WERROR=ON -DCORING_BUILD_LEGACY=OFF -DCMAKE_CXX_COMPILER=clang++-19
+          -DCMAKE_CXX_SCAN_FOR_MODULES=OFF
+          -DCMAKE_INTERPROCEDURAL_OPTIMIZATION=OFF -DCORING5_FUZZ=ON
+      - run: cmake --build build --target fuzz_http1_head fuzz_http1_body fuzz_config fuzz_endpoint
+      - name: 30 s per target
+        run: |
+          for t in fuzz_http1_head fuzz_http1_body fuzz_config fuzz_endpoint; do
+            mkdir -p corpus-$t
+            ./build/tests/coring5/fuzz/$t -max_total_time=30 corpus-$t
+          done

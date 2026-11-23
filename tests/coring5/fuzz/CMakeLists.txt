@@ -2,6 +2,14 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   message(FATAL_ERROR "CORING5_FUZZ requires clang (libFuzzer)")
 endif()
 
+# Instrument the implementation too. Target options keep the sanitizer link
+# settings out of CMake's compiler and pthread probes.
+foreach(lib IN ITEMS coring5_base coring5_config coring5_proto_http1)
+  target_compile_options(${lib} PRIVATE -fsanitize=fuzzer-no-link,address,undefined
+                                        -fno-omit-frame-pointer)
+  target_link_options(${lib} INTERFACE -fsanitize=address,undefined)
+endforeach()
+
 function(coring5_fuzz name source lib)
   add_executable(${name} ${source})
   target_link_libraries(${name} PRIVATE ${lib})

@@ -5,11 +5,18 @@
 // test sets `sq_capacity`; completions are injected with complete(). No kernel,
 // no fds are touched. Single-threaded, like the real ring.
 
+#include "coring5/base/Result.hpp"
 #include "coring5/io/Cqe.hpp"
+#include "coring5/io/RingConfig.hpp"
 #include <algorithm>
 #include <cstdint>
 #include <deque>
+#include <functional>
+#include <memory>
+#include <linux/openat2.h>
+#include <sys/stat.h>
 #include <span>
+#include <stdexcept>
 #include <sys/socket.h>
 #include <utility>
 #include <vector>
@@ -22,18 +29,50 @@ struct FakeSubmission {
   int fd{-1};
   const void *buf{nullptr};
   uint32_t len{0};
+  uint64_t offset{};
 };
 
 class FakeBufferRing;
 
 class FakeRing {
 public:
+  [[nodiscard]] static Result<std::unique_ptr<FakeRing>>
+  create(const RingConfig &cfg) {
+    auto ring = std::make_unique<FakeRing>();
+    ring->sq_capacity = cfg.sq_entries;
+    return ring;
+  }
+
   // SQ capacity before prep_* start failing (shed-load paths); ~0 = unlimited.
   uint32_t sq_capacity{~0U};
   uint64_t sq_full{0};
 
+  bool open_file(int dir, const char *path, open_how *, OpTag t) noexcept {
+    return rec(OpKind::FileOpen, t, dir, path);
+  }
+  bool stat_file(int fd, unsigned fields, struct statx *out, OpTag t) noexcept {
+    return rec(OpKind::FileStat, t, fd, out, fields);
+  }
+  bool read_file(int fd, void *buf, uint32_t len, uint64_t offset,
+                 OpTag t) noexcept {
+    if (!rec(OpKind::Read, t, fd, buf, len)) {
+      return false;
+    }
+    pending.back().offset = offset;
+    return true;
+  }
+  bool cancel_tag(OpTag target, OpTag t) noexcept {
+    if (!rec(OpKind::Cancel, t, -1)) {
+      return false;
+    }
+    pending.back().offset = target.raw;
+    return true;
+  }
   [[nodiscard]] bool accept_multishot(int fd, OpTag t) noexcept {
     return rec(OpKind::Accept, t, fd);
+  }
+  bool poll_disconnect(int fd, OpTag t) noexcept {
+    return rec(OpKind::Disconnect, t, fd);
   }
   [[nodiscard]] bool poll_multishot(int fd, OpTag t) noexcept {
     return rec(OpKind::Mailbox, t, fd);
@@ -91,6 +130,9 @@ public:
       f(c);
       ++n;
     }
+    if (after_batch) {
+      after_batch();
+    }
     return n;
   }
   // "Submitting" moves recorded ops to `submitted` and frees SQ space.
@@ -98,8 +140,25 @@ public:
     submitted.insert(submitted.end(), pending.begin(), pending.end());
     pending.clear();
   }
+  [[nodiscard]] Result<unsigned> submit_nowait() {
+    const auto n = static_cast<unsigned>(pending.size());
+    flush();
+    return n;
+  }
+  // A blocking wait needs a scripted batch. Fail the test at an unexpected
+  // wait (e.g. if the worker tries to sleep with a ready Exchange).
+  [[nodiscard]] Result<unsigned> submit_and_wait(unsigned min_complete) {
+    if (cq_.size() < min_complete) {
+      throw std::logic_error("FakeRing: waiting for an unscripted completion");
+    }
+    return submit_nowait();
+  }
+  void flush_events() noexcept {}
+  [[nodiscard]] bool cq_overflowed() const noexcept { return false; }
   [[nodiscard]] uint64_t sq_full_events() const noexcept { return sq_full; }
 
+  // Inspect closed connections at the CQ batch boundary, before worker reaping.
+  std::function<void()> after_batch;
   std::vector<FakeSubmission> pending;
   std::vector<FakeSubmission> submitted;
 
@@ -150,6 +209,10 @@ public:
     uint32_t len_{0};
   };
 
+  [[nodiscard]] static Result<FakeBufferRing>
+  create(FakeRing &, uint16_t, uint32_t count, uint32_t buf_size) {
+    return FakeBufferRing(count, buf_size);
+  }
   FakeBufferRing(uint32_t count, uint32_t buf_size)
       : buf_size_(buf_size), slab_(static_cast<std::size_t>(count) * buf_size),
         available_(count), count_(count) {}

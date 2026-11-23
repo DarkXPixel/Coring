@@ -32,7 +32,9 @@ DialStatus UpstreamDialer::fail(Errc why) noexcept {
 }
 
 DialStatus UpstreamDialer::start(IoContext &ctx, ConnCore &core,
-                                 UpstreamPool &pool, UpstreamId upstream) {
+                                 UpstreamPool &pool, UpstreamId upstream,
+                                 uint32_t attempt_limit, Millis budget_limit,
+                                 BackendRef first) {
   pool_ = &pool;
   upstream_ = upstream;
   attempts_ = 0;
@@ -43,17 +45,19 @@ DialStatus UpstreamDialer::start(IoContext &ctx, ConnCore &core,
   if (backends == 0) {
     return fail(Errc::UpstreamUnavailable);
   }
-  max_attempts_ = std::min(kMaxAttempts, backends);
-  budget_ = pool.connect_timeout(upstream, ctx.limits->connect_timeout);
+  max_attempts_ = std::clamp(attempt_limit, 1u, std::min(kMaxAttempts, backends));
+  budget_ = std::min(budget_limit, pool.connect_timeout(upstream, ctx.limits->connect_timeout));
   deadline_ = ctx.now + budget_;
   status_ = DialStatus::Pending;
-  attempt(ctx, core);
+  attempt(ctx, core, first);
   return status_;
 }
 
-void UpstreamDialer::attempt(IoContext &ctx, ConnCore &core) {
+void UpstreamDialer::attempt(IoContext &ctx, ConnCore &core, BackendRef first) {
   const std::span<const uint32_t> tried(tried_, attempts_);
-  auto ref = pool_->pick(upstream_, ctx.now, tried);
+  auto ref = first.valid() && first.upstream == upstream_
+                 ? Result<BackendRef>{first}
+                 : pool_->pick(upstream_, ctx.now, tried);
   if (!ref) {
     fail(Errc::UpstreamUnavailable);
     return;
@@ -153,7 +157,8 @@ void UpstreamDialer::settle(IoContext &ctx, ConnCore &core) {
     attempt(ctx, core);
     return;
   }
-  fail(Errc::UpstreamUnavailable);
+  fail(err == ECANCELED || err == ETIMEDOUT ? Errc::Timeout
+                                            : Errc::UpstreamUnavailable);
 }
 
 DialedUpstream UpstreamDialer::take(ConnCore &core) noexcept {

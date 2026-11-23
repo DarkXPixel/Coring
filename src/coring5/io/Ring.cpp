@@ -1,7 +1,9 @@
 #include "coring5/io/Ring.hpp"
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
+#include <new>
 #include <liburing.h>
 #include <poll.h>
 #include <sys/utsname.h>
@@ -26,13 +28,17 @@ void probe_kernel(RingCaps &caps) {
 }
 
 void probe_ops(io_uring &ring, RingCaps &caps) {
-  io_uring_probe *p = io_uring_get_probe_ring(&ring);
-  if (p == nullptr) {
+  // Probe on this worker's stack. liburing can recycle a probe mapping's
+  // address for another worker's buffer ring during concurrent startup.
+  constexpr unsigned op_count = 256;
+  alignas(io_uring_probe) std::byte storage[
+      sizeof(io_uring_probe) + op_count * sizeof(io_uring_probe_op)]{};
+  auto *p = ::new (storage) io_uring_probe;
+  if (io_uring_register_probe(&ring, p, op_count) < 0) {
     return;
   }
   caps.send_zc = io_uring_opcode_supported(p, IORING_OP_SEND_ZC) != 0;
   caps.splice = io_uring_opcode_supported(p, IORING_OP_SPLICE) != 0;
-  io_uring_free_probe(p);
 }
 
 } // namespace
@@ -99,6 +105,17 @@ bool Ring::accept_multishot(int listen_fd, OpTag tag) noexcept {
   return true;
 }
 
+bool Ring::poll_disconnect(int fd, OpTag tag) noexcept {
+  auto *s = sqe();
+  if (!s) {
+    return false;
+  }
+  // Read half-close alone still permits delivery of the HTTP response.
+  io_uring_prep_poll_add(s, fd, POLLERR | POLLHUP);
+  io_uring_sqe_set_data64(s, tag.raw);
+  return true;
+}
+
 bool Ring::poll_multishot(int fd, OpTag tag) noexcept {
   io_uring_sqe *s = sqe();
   if (s == nullptr) {
@@ -139,6 +156,52 @@ bool Ring::recv_multishot_provided(int fd, uint16_t bgid, OpTag tag) noexcept {
   io_uring_prep_recv_multishot(s, fd, nullptr, 0, 0);
   s->flags |= IOSQE_BUFFER_SELECT;
   s->buf_group = bgid;
+  io_uring_sqe_set_data64(s, tag.raw);
+  return true;
+}
+
+bool Ring::open_file(int dir, const char *path, open_how *how,
+                     OpTag tag) noexcept {
+  auto *s = sqe();
+  if (!s) {
+    return false;
+  }
+  io_uring_prep_openat2(s, dir, path, how);
+  s->flags |= IOSQE_ASYNC;
+  io_uring_sqe_set_data64(s, tag.raw);
+  return true;
+}
+
+bool Ring::stat_file(int fd, unsigned fields, struct statx *out,
+                     OpTag tag) noexcept {
+  auto *s = sqe();
+  if (!s) {
+    return false;
+  }
+  io_uring_prep_statx(s, fd, "", AT_EMPTY_PATH, fields, out);
+  s->flags |= IOSQE_ASYNC;
+  io_uring_sqe_set_data64(s, tag.raw);
+  return true;
+}
+
+bool Ring::read_file(int fd, void *buf, uint32_t len, uint64_t offset,
+                     OpTag tag) noexcept {
+  auto *s = sqe();
+  if (!s) {
+    return false;
+  }
+  io_uring_prep_read(s, fd, buf, len, offset);
+  s->flags |= IOSQE_ASYNC;
+  io_uring_sqe_set_data64(s, tag.raw);
+  return true;
+}
+
+bool Ring::cancel_tag(OpTag target, OpTag tag) noexcept {
+  auto *s = sqe();
+  if (!s) {
+    return false;
+  }
+  io_uring_prep_cancel64(s, target.raw, 0);
   io_uring_sqe_set_data64(s, tag.raw);
   return true;
 }

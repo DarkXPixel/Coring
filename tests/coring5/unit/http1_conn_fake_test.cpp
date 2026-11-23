@@ -74,7 +74,7 @@ void random_step(ConnHarness &h, std::mt19937 &rng) {
 } // namespace
 
 TEST(Http1ConnFake, SeededLifecycleClosesCleanlyAtEveryState) {
-  for (uint32_t seed = 1; seed <= 1000; ++seed) {
+  for (uint32_t seed = 1; seed <= 3000; ++seed) {
     std::mt19937 rng(seed);
     ConnHarness h;
     const int steps = static_cast<int>(rng() % 12);
@@ -148,7 +148,9 @@ TEST(Http1ConnFake, DeliveryAfterIngressReapDrainsBothExchanges) {
   // attached to the same ingress so delivery has to detach it.
   const SideRef ingress{ConnRef{PoolId::Http1, h.c().core.handle()}, 0};
   const Handle orphan = exchanges.open(ingress, RequestMeta{});
-  ASSERT_TRUE(orphan.valid());
+  auto *attached = exchanges.get(orphan);
+  ASSERT_NE(attached, nullptr);
+  ASSERT_TRUE(attached->attach_responder(SideRef{}));
   h.c().core.close(h.ctx(), Errc::Shutdown);
   h.flush_pending();
   ASSERT_TRUE(h.closed());
@@ -159,16 +161,15 @@ TEST(Http1ConnFake, DeliveryAfterIngressReapDrainsBothExchanges) {
   ASSERT_NE(detached, nullptr);
   ASSERT_TRUE(detached->ingress_detached());
   ASSERT_EQ(detached->responder_state(), Exchange::ResponderState::None);
-  const auto *attached = exchanges.get(orphan);
-  ASSERT_NE(attached, nullptr);
   ASSERT_FALSE(attached->ingress_detached());
-  ASSERT_EQ(attached->responder_state(), Exchange::ResponderState::None);
+  ASSERT_EQ(attached->responder_state(), Exchange::ResponderState::Attached);
 
   h.drain_exchanges(1);
   EXPECT_EQ(exchanges.get(session_exchange), nullptr);
   const auto *forced = exchanges.get(orphan);
   ASSERT_NE(forced, nullptr);
   EXPECT_TRUE(forced->ingress_detached());
+  EXPECT_EQ(forced->responder_state(), Exchange::ResponderState::Detached);
   EXPECT_NE(forced->pending_events(Side::Responder) & ExEvent::kPeerDetached, 0);
   EXPECT_TRUE(exchanges.has_ready());
 

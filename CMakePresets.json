@@ -45,6 +45,8 @@
       "binaryDir": "${sourceDir}/build-${presetName}",
       "cacheVariables": {
         "CORING_BUILD_LEGACY": "OFF",
+        "CORING5_BUILD_TESTS": "ON",
+        "CORING5_WERROR": "ON",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     },
@@ -97,6 +99,7 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_CXX_SCAN_FOR_MODULES": "OFF",
         "CMAKE_INTERPROCEDURAL_OPTIMIZATION": "OFF",
         "CORING5_FUZZ": "ON"
       }

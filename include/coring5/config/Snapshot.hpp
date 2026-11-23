@@ -13,6 +13,7 @@
 
 #include "coring5/base/Endpoint.hpp"
 #include "coring5/base/Types.hpp"
+#include "coring5/config/Routes.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -132,6 +133,23 @@ struct ConfigSnapshot {
   Limits limits;
   std::vector<ListenerSpec> listeners;
   std::vector<UpstreamSpec> upstreams;
+  RouteSets routes;
+
+  // Control thread only, after validation and stable upstream ID assignment.
+  void install_routes(RouteSets sets);
+
+  [[nodiscard]] RouteMatch match(ListenerId id, std::string_view host,
+                                 std::string_view target,
+                                 std::span<char> scratch) const noexcept {
+    const auto *listener = find(id);
+    if (!listener) {
+      return {};
+    }
+    const auto set = routes.find(listener->route);
+    return set == routes.end()
+               ? RouteMatch{}
+               : match_route(set->second, host, target, scratch);
+  }
 
   [[nodiscard]] const ListenerSpec *find(ListenerId id) const noexcept {
     for (const auto &l : listeners) {
@@ -152,12 +170,23 @@ struct ConfigSnapshot {
   }
 };
 
+// Daemon-owned and restart-only. Workers receive only a pointer to their ring.
+struct AccessLogConfig {
+  std::string path;
+  uint64_t rotate_bytes{0};
+  uint8_t rotate_files{0};
+
+  bool operator==(const AccessLogConfig &) const = default;
+};
+
 // Raw result of parsing, before id assignment.
 struct ParsedConfig {
   RuntimeConfig runtime;
   Limits limits;
   std::vector<ListenerSpec> listeners;
   std::vector<UpstreamSpec> upstreams;
+  RouteSets routes;
+  AccessLogConfig access_log{};
 };
 
 } // namespace Coring5

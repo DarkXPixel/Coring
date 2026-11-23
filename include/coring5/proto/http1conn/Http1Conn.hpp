@@ -9,18 +9,16 @@
 //   timer     -> session.on_deadline    -> sync()
 //   exchange  -> on_exchange() (called by the Worker's ready-list drain)
 //
-// sync() is the only place that submits: routes a fresh Exchange, queues at
-// most ONE send and ONE recv, re-arms the deadline when its epoch changed and
-// closes when the session says so. Every submission is counted (I2); the
-// session is released (exchange detached, chunks returned) once nothing is in
-// flight. No Lease is kept across a step (I10): the session copies what it
-// needs into its bounded stage chunk.
-//
-// Routing is not implemented yet: every accepted request is answered with a
-// synthetic 501 (handlers are M4).
+// Ingress owns one session and one active route. File/HTTP egress operations
+// share its ConnCore and peer fd. Per-request storage stays in the slot until
+// all SQEs using it settle. A peer reset cancels both sides even while ingress
+// is waiting for an upstream response. All recv leases recycle in the CQE step.
 
+#include "coring5/http/Handlers.hpp"
 #include "coring5/io/ConnCore.hpp"
+#include "coring5/obs/AccessLog.hpp"
 #include "coring5/proto/http1session/ServerSession.hpp"
+#include "coring5/proto/http1conn/Responders.hpp"
 #include <optional>
 
 namespace Coring5 {
@@ -47,11 +45,30 @@ public:
 #endif
 
 private:
+  enum class ResponseKind : uint8_t { Synthetic, Respond, Redirect };
+
+  void begin_request() noexcept;
+  void capture_request_head(const Http1::RequestHead &head) noexcept;
+  void log_request(const Http1::RequestOutcome &outcome) noexcept;
+  void select_route(const Http1::RequestHead &head) noexcept;
+  void apply_response(Exchange &ex) noexcept;
   void sync(IoContext &ctx);
   void arm_deadline(IoContext &ctx);
 
-  std::optional<Http1::ServerSession> s_; // emplaced in start() (needs ctx)
+  IoContext *context_{nullptr};
+  ListenerId listener_{};
+  // Own only the selected immutable bytes, including across a snapshot reload.
+  std::shared_ptr<const std::string> response_text_;
+  ResponseField location_{};
+  ApplyCursor cursor_{};
+  uint16_t response_status_{0};
+  ResponseKind response_kind_{ResponseKind::Synthetic};
+  AccessRecord access_record_{};
+  TimePoint request_started_{};
+  std::variant<std::monostate, FileResponder, ProxyResponder> adapter_;
+  std::optional<Http1::ServerSession> s_; // destroyed before response storage
   uint32_t armed_epoch_{0};
+  bool watching_disconnect_{};
   bool recv_inflight_{false};
   bool send_inflight_{false};
 };

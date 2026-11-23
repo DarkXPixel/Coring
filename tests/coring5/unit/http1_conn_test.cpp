@@ -8,9 +8,6 @@
 // INVARIANTS.md review-checklist state: live()==0, inflight==0,
 // stale_events==0, pools full, no leaked fds.
 //
-// Routing is not implemented yet: Http1Conn answers every accepted request with
-// a synthetic 501, which is exactly what these tests assert.
-
 #include "http1_conn_harness.hpp"
 
 using namespace Coring5;
@@ -51,6 +48,26 @@ std::string drain_sends(ConnHarness &h) {
   return out;
 }
 
+ConfigSnapshot routed(PathRoutes paths, std::string host = "") {
+  ConfigSnapshot config;
+  auto &listener = config.listeners.emplace_back();
+  listener.id = kHttpListener;
+  listener.protocol = ProtocolKind::Http1;
+  listener.route = "main";
+  auto &set = config.routes[listener.route];
+  set.hosts.emplace(std::move(host), 0);
+  set.vhosts.emplace_back().exact = std::move(paths);
+  return config;
+}
+
+void close_cleanly(ConnHarness &h) {
+  h.on_drain();
+  h.flush_pending();
+  ASSERT_TRUE(h.closed());
+  h.reap_closed();
+  h.expect_clean_end();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- start/sync
@@ -69,7 +86,7 @@ TEST(Http1Conn, StartArmsOneRecvAndHeaderDeadline) {
   EXPECT_EQ(h.session().deadline().kind, Http1::SessionDeadline::HeaderRead);
 }
 
-TEST(Http1Conn, RequestHeadIsAnsweredWithSynthetic501) {
+TEST(Http1Conn, UnconfiguredListenerKeepsSynthetic501Fallback) {
   ConnHarness h;
   feed(h, req("GET", "/"));
   const std::string out = drain_sends(h);
@@ -79,6 +96,105 @@ TEST(Http1Conn, RequestHeadIsAnsweredWithSynthetic501) {
   // Keep-alive: a fresh recv is armed and the connection is idle.
   EXPECT_EQ(h.session().rx(), Http1::RxState::Idle);
   EXPECT_EQ(h.session().deadline().kind, Http1::SessionDeadline::KeepAlive);
+}
+
+TEST(Http1Conn, PipelinedRoutesUseHostAndRequestTarget) {
+  const auto config = routed({{"/a", RespondRoute{201, "hello"}},
+                              {"/b", RedirectRoute{307, "/new?x=1"}}}, "a");
+  ConnHarness h(8, 8, ConnHarness::base_limits(), &config);
+  h.ctx().accepted.listener = ListenerId{99}; // a later accept on this worker
+  // Split the first head so routing also runs with parser views into the stage.
+  feed(h, "GET /%61?ignored HTTP/1.1\r\n");
+  feed(h, "Host: A:80\r\n\r\n" + req("GET", "/b"));
+  EXPECT_EQ(drain_sends(h),
+            "HTTP/1.1 201 Created\r\nContent-Length: 5\r\n\r\nhello"
+            "HTTP/1.1 307 Temporary Redirect\r\nLocation: /new?x=1\r\n"
+            "Content-Length: 0\r\n\r\n");
+  EXPECT_EQ(h.session().served(), 2U);
+  close_cleanly(h);
+}
+
+TEST(Http1Conn, ConfiguredRouteMissReturns404) {
+  const auto config = routed({{"/a", RespondRoute{200, "ok"}}});
+  ConnHarness h(8, 8, ConnHarness::base_limits(), &config);
+  feed(h, req("GET", "/missing"));
+  EXPECT_EQ(drain_sends(h), "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+  close_cleanly(h);
+}
+
+TEST(Http1Conn, MissingWorkerResourcesReturn503) {
+  const auto config = routed({{"/file", StaticRoute{"/var/www"}},
+                              {"/proxy", ProxyRoute{"backend", UpstreamId{7}}}});
+  ConnHarness h(8, 8, ConnHarness::base_limits(), &config);
+  for (const auto path : {"/file", "/proxy"}) {
+    feed(h, req("GET", path));
+    EXPECT_EQ(drain_sends(h),
+              "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n");
+  }
+  close_cleanly(h);
+}
+
+TEST(Http1Conn, HeadAndEmptyRoutesUseCorrectFraming) {
+  const auto config = routed({{"/head", RespondRoute{200, "hello"}},
+                              {"/empty", RespondRoute{200, ""}},
+                              {"/none", RespondRoute{204, ""}},
+                              {"/old", RedirectRoute{308, "/new"}}});
+  ConnHarness h(8, 8, ConnHarness::base_limits(), &config);
+  feed(h, req("HEAD", "/head"));
+  EXPECT_EQ(drain_sends(h), "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
+  feed(h, req("GET", "/empty"));
+  EXPECT_EQ(drain_sends(h), "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+  feed(h, req("GET", "/none"));
+  EXPECT_EQ(drain_sends(h), "HTTP/1.1 204 No Content\r\n\r\n");
+  feed(h, req("HEAD", "/old"));
+  EXPECT_EQ(drain_sends(h),
+            "HTTP/1.1 308 Permanent Redirect\r\nLocation: /new\r\n"
+            "Content-Length: 0\r\n\r\n");
+  close_cleanly(h);
+}
+
+TEST(Http1Conn, LongRedirectSurvivesReloadBeforeSerialization) {
+  const std::string target = "/" + std::string(kMaxLocationBytes - 1, 'x');
+  std::optional config = routed({{"/", RedirectRoute{302, target}}});
+  ConnHarness h(8, 8, ConnHarness::base_limits(), &*config,
+                kMaxLocationBytes + 128);
+  h.deliver_recv(req("GET", "/"));
+  h.ctx().snapshot = nullptr;
+  config.reset();
+  h.drain_exchanges();
+  EXPECT_EQ(drain_sends(h), "HTTP/1.1 302 Found\r\nLocation: " + target +
+                               "\r\nContent-Length: 0\r\n\r\n");
+  close_cleanly(h);
+}
+
+TEST(Http1Conn, ReloadPreservesStreamingBodyAndRoutesNextRequest) {
+  const std::string old_body(kHigh * 3, 'a');
+  std::optional old_config = routed({{"/", RespondRoute{200, old_body}}});
+  auto next_config = routed({{"/", RespondRoute{201, "new"}}});
+  ConnHarness h(8, 8, ConnHarness::base_limits(), &*old_config);
+  feed(h, req("GET", "/"));
+  auto *ex = h.exchanges().get(h.session().exchange());
+  ASSERT_NE(ex, nullptr);
+  ASSERT_EQ(ex->stream(StreamId::Res).queued(), kHigh);
+  h.ctx().snapshot = &next_config;
+  old_config.reset();
+  EXPECT_EQ(drain_sends(h),
+            "HTTP/1.1 200 OK\r\nContent-Length: 192\r\n\r\n" + old_body);
+  feed(h, req("GET", "/"));
+  EXPECT_EQ(drain_sends(h), "HTTP/1.1 201 Created\r\nContent-Length: 3\r\n\r\nnew");
+  close_cleanly(h);
+}
+
+TEST(Http1Conn, ClosingWithLocalProducerBlockedReapsExchange) {
+  const auto config = routed({{"/", RespondRoute{200, std::string(kHigh * 2, 'a')}}});
+  ConnHarness h(8, 8, ConnHarness::base_limits(), &config);
+  feed(h, req("GET", "/"));
+  ASSERT_EQ(h.exchanges().live(), 1U);
+  h.c().core.close(h.ctx(), Errc::Reset);
+  h.flush_pending();
+  ASSERT_TRUE(h.closed());
+  h.reap_closed();
+  h.expect_clean_end();
 }
 
 TEST(Http1Conn, SendIsQueuedAtMostOncePerSync) {

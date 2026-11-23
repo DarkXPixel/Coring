@@ -4,7 +4,7 @@
 //
 //   reload(parsed):
 //     1. validate                                   -- nothing touched on error
-//     2. reject runtime-section changes             -- "restart required"
+//     2. reject runtime/access-log changes           -- "restart required"
 //     3. assign ListenerIds (same name+address => same id)
 //     4. create per-worker SO_REUSEPORT sockets for NEW listeners (can fail)
 //     5. build the immutable snapshot
@@ -22,6 +22,7 @@
 #include <expected>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 namespace Coring5 {
@@ -46,10 +47,17 @@ public:
   }
 
 private:
+  void retire_route_text(const std::shared_ptr<const ConfigSnapshot> &old);
+
   WorkerGroup &workers_;
   mutable std::mutex mtx_;
   std::shared_ptr<const ConfigSnapshot> current_;
+  // Keep published root fds pinned here through worker acknowledgements.
+  std::shared_ptr<const StaticRoots> current_roots_;
+  // Keep the control thread responsible for freeing previous response bytes.
+  std::set<std::shared_ptr<const std::string>, std::owner_less<>> retired_text_;
   RuntimeConfig runtime_;
+  AccessLogConfig access_log_;
   bool have_runtime_{false};
   uint32_t next_listener_id_{1};
   uint32_t next_upstream_id_{1};

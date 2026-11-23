@@ -129,3 +129,62 @@ TEST(Reload, UnderLoadDoesNotFailRequestsOnKeptListeners) {
   EXPECT_EQ(failed.load(), 0) << "requests failed during reload";
   EXPECT_EQ(s.sum(&WorkerMetrics::stale_events), 0U);
 }
+
+TEST(Reload, PublishesRouteOnlyChangesAndRejectsDanglingBindings) {
+  CORING5_REQUIRE_RING();
+  const std::string listener = make_config(1, {}) + R"(
+[[listener]]
+name = "web"
+address = "127.0.0.1:0"
+protocol = "http1"
+route = "site"
+)";
+  const std::string routes = R"(
+[[route_set]]
+name = "site"
+[[route_set.vhost]]
+default = true
+location = [{path="/", action="respond", body="first"}]
+)";
+  Stack stack;
+  ASSERT_EQ(stack.start(listener + routes), "");
+  const auto old = stack.config->current();
+  const auto id = old->listeners.front().id;
+  const auto port = stack.port();
+  ASSERT_NE(port, 0);
+  Client client(port);
+  ASSERT_TRUE(client.connected());
+  const std::string request = "GET / HTTP/1.1\r\nHost: site\r\n\r\n";
+  constexpr std::string_view first =
+      "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst";
+  ASSERT_TRUE(client.send_all(request));
+  ASSERT_EQ(client.recv_n(first.size()), first);
+  auto changed = listener + routes;
+  changed.replace(changed.find("first"), 5, "second");
+  auto parsed = parse_config(changed);
+  ASSERT_TRUE(parsed) << parsed.error();
+  auto report = stack.config->apply(std::move(*parsed));
+  ASSERT_TRUE(report) << report.error();
+  EXPECT_TRUE(report->workers_acked);
+  EXPECT_TRUE(report->diff.routes_changed);
+  EXPECT_EQ(report->diff.kept, (std::vector<ListenerId>{id}));
+  EXPECT_TRUE(report->diff.added.empty());
+  EXPECT_TRUE(report->diff.removed.empty());
+  EXPECT_EQ(stack.port(), port);
+  constexpr std::string_view second =
+      "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond";
+  ASSERT_TRUE(client.send_all(request));
+  EXPECT_EQ(client.recv_n(second.size()), second);
+  const auto current = stack.config->current();
+  EXPECT_EQ(current->generation, old->generation + 1);
+  std::array<char, 8> scratch;
+  const auto before = old->match(id, "", "/", scratch);
+  const auto after = current->match(id, "", "/", scratch);
+  ASSERT_NE(before.action, nullptr);
+  ASSERT_NE(after.action, nullptr);
+  EXPECT_EQ(std::get<RespondRoute>(*before.action).body(), "first");
+  EXPECT_EQ(std::get<RespondRoute>(*after.action).body(), "second");
+
+  EXPECT_NE(stack.reload(listener).find("unknown route set"), std::string::npos);
+  EXPECT_EQ(stack.config->current(), current);
+}

@@ -10,12 +10,16 @@
 #include "coring5/io/RingSeam.hpp"
 #include "coring5/io/TimerWheel.hpp"
 #include "coring5/mem/ChunkPool.hpp"
+#include "coring5/obs/AccessLog.hpp"
 #include "coring5/obs/Metrics.hpp"
+#include <span>
 #include <vector>
 
 namespace Coring5 {
 
+struct StaticRoots;
 class UpstreamPool;  // upstream/UpstreamPool.hpp (kept out of io's include graph)
+class IdleUpstreams;
 class ExchangePool;  // http/ExchangePool.hpp (io never includes http)
 
 struct IoContext {
@@ -47,6 +51,13 @@ struct IoContext {
   // new connection's start(). Plain ids (invariant I8), never snapshot
   // pointers.
   AcceptInfo accepted{};
+
+  // Worker-owned, updated on reload. Borrow only during a request lookup.
+  const ConfigSnapshot *snapshot{nullptr};
+  std::span<char> route_scratch{};
+  const StaticRoots *static_roots{};
+  IdleUpstreams *idle_upstreams{nullptr};
+  AccessLogRing *access_log{nullptr}; // optional, this worker is sole producer
 };
 
 } // namespace Coring5

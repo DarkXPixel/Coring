@@ -13,7 +13,8 @@
 //   Error      sticky; `error`/`reason` say why.
 // `consumed` is always counted from the start of `in` (it includes any framing
 // bytes skipped before a Data run). The caller advances by `consumed`.
-// Trailer contents are validated, counted and discarded.
+// Trailer contents are validated and counted. An adapter can supply storage
+// when it needs the validated wire block after Done.
 
 #include "coring5/base/Result.hpp"
 #include "coring5/config/Snapshot.hpp"
@@ -37,6 +38,12 @@ enum class ChunkedReason : uint8_t {
   TrailersTooLarge,
   PrematureEof,
 };
+
+[[nodiscard]] constexpr bool is_trailer_error(ChunkedReason reason) noexcept {
+  return reason == ChunkedReason::BadTrailer ||
+         reason == ChunkedReason::ForbiddenTrailer ||
+         reason == ChunkedReason::TrailersTooLarge;
+}
 
 struct ChunkedStep {
   ChunkedEvent event{ChunkedEvent::NeedMore};
@@ -64,6 +71,15 @@ public:
   [[nodiscard]] ChunkedReason reason() const noexcept { return reason_; }
   [[nodiscard]] uint64_t body_bytes() const noexcept { return body_bytes_; }
   [[nodiscard]] uint32_t trailers_seen() const noexcept { return trailers_; }
+  // Attach storage before feeding trailer bytes and keep it until Done.
+  void capture_trailers(std::span<char> storage) noexcept {
+    trailer_storage_ = storage;
+  }
+  [[nodiscard]] std::span<const char> trailer_block() const noexcept {
+    return done() && !trailer_storage_.empty()
+               ? trailer_storage_.first(trailer_bytes_)
+               : std::span<const char>{};
+  }
 
   // Peer closed the transport: Ok only if the body is complete.
   [[nodiscard]] Errc on_eof() noexcept;
@@ -111,6 +127,7 @@ private:
   uint32_t max_trailers_{100};
   uint32_t max_ext_bytes_{kDefaultMaxExtBytes};
   char name_[kNameCap]{};
+  std::span<char> trailer_storage_{};
 };
 
 } // namespace Coring5::Http1

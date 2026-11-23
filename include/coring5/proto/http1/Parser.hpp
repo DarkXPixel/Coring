@@ -50,6 +50,7 @@ enum class ParseError : uint8_t {
 struct Header {
   std::string_view name;
   std::string_view value;
+  [[nodiscard]] bool named(std::string_view key) const noexcept;
 };
 
 inline constexpr std::size_t kMaxHeadersHard = 128;
@@ -92,5 +93,9 @@ struct HeadResult {
 // is detected (do not wait for more bytes).
 [[nodiscard]] HeadResult parse_head(std::span<const char> in,
                                     const Limits &limits, RequestHead &out);
+
+// The response adapter uses the same strict field and framing parser.
+[[nodiscard]] HeadResult parse_response_head(std::span<const char> in,
+    const Limits &limits, RequestHead &fields, uint16_t &status);
 
 } // namespace Coring5::Http1

@@ -71,7 +71,8 @@ bool Exchange::attach_responder(SideRef responder) noexcept {
   return true;
 }
 
-HeadStatus Exchange::publish(ResponseMeta meta) noexcept {
+HeadStatus Exchange::publish(ResponseMeta meta,
+                             std::span<const ResponseField> fields) noexcept {
   if (meta.status < 200 || meta.status > 599) {
     return HeadStatus::BadStatus;
   }
@@ -81,6 +82,7 @@ HeadStatus Exchange::publish(ResponseMeta meta) noexcept {
   meta.no_content =
       meta.no_content || content_forbidden(meta.status, req_meta_.head_only);
   res_meta_ = meta;
+  response_fields_ = fields;
   head_published_ = true;
   interim_ = 0;
   phase_ = Phase::Responding;
@@ -105,11 +107,13 @@ HeadStatus Exchange::respond_synthetic(uint16_t status) noexcept {
   return publish(m);
 }
 
-HeadStatus Exchange::publish_final(const ResponseMeta &meta) noexcept {
+HeadStatus
+Exchange::publish_final(const ResponseMeta &meta,
+                        std::span<const ResponseField> fields) noexcept {
   if (phase_ != Phase::Active) {
     return HeadStatus::WrongPhase;
   }
-  return publish(meta);
+  return publish(meta, fields);
 }
 
 HeadStatus Exchange::publish_interim(uint16_t status) noexcept {
@@ -130,8 +134,29 @@ HeadStatus Exchange::publish_interim(uint16_t status) noexcept {
   return HeadStatus::Ok;
 }
 
+HeadStatus Exchange::publish_tunnel(
+    std::span<const ResponseField> fields) noexcept {
+  if (phase_ != Phase::Active || !req_meta_.accepts_interim ||
+      req_meta_.has_body || req_meta_.head_only || res_.state() != StreamState::Open) {
+    return HeadStatus::WrongPhase;
+  }
+  if (ingress_detached_) {
+    return HeadStatus::Gone;
+  }
+  if (!req_.begin_tunnel()) {
+    return HeadStatus::WrongPhase;
+  }
+  res_meta_ = {.status = 101};
+  response_fields_ = fields;
+  head_published_ = true;
+  interim_ = 0;
+  phase_ = Phase::Responding;
+  raise(ExEvent::kResponseHeadReady);
+  return HeadStatus::Ok;
+}
+
 bool Exchange::cancel_request_body() noexcept {
-  if (phase_ != Phase::Responding || !head_published_) {
+  if (phase_ != Phase::Responding || !head_published_ || tunneling()) {
     return false;
   }
   req_.abort(Errc::Canceled);
@@ -143,6 +168,8 @@ void Exchange::detach(Side who, Errc why) noexcept {
   if (who == Side::Ingress) {
     if (!ingress_detached_) {
       ingress_detached_ = true;
+      response_fields_ = {};
+      response_trailers_ = {};
       if (req_.state() == StreamState::Open) {
         req_.abort(why);
       }
@@ -197,6 +224,16 @@ WriteStatus Exchange::finish(StreamId s, bool has_trailers) noexcept {
   const WriteStatus r = mut(s).finish(has_trailers);
   harvest();
   return r;
+}
+
+WriteStatus Exchange::finish_response(
+    std::span<const ResponseField> trailers) noexcept {
+  response_trailers_ = trailers;
+  const auto result = finish(StreamId::Res, !trailers.empty());
+  if (result != WriteStatus::Ok) {
+    response_trailers_ = {};
+  }
+  return result;
 }
 
 void Exchange::consume(StreamId s, uint32_t n) noexcept {

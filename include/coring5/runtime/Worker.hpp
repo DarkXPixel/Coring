@@ -13,13 +13,14 @@
 
 #include "coring5/base/Types.hpp"
 #include "coring5/config/Snapshot.hpp"
-#include "coring5/io/BufferRing.hpp"
 #include "coring5/io/IoContext.hpp"
-#include "coring5/io/Ring.hpp"
+#include "coring5/io/RingSeam.hpp"
 #include "coring5/http/ExchangePool.hpp"
 #include "coring5/io/TimerWheel.hpp"
 #include "coring5/mem/ChunkPool.hpp"
 #include "coring5/mem/HandlePool.hpp"
+#include "coring5/net/IdleUpstreams.hpp"
+#include "coring5/obs/AccessLog.hpp"
 #include "coring5/obs/Metrics.hpp"
 #include "coring5/runtime/ConnPools.hpp"
 #include "coring5/runtime/Mailbox.hpp"
@@ -37,14 +38,15 @@ struct WorkerInit {
   int cpu{-1}; // -1: do not pin
   Mailbox *mailbox{nullptr};
   WorkerMetrics *metrics{nullptr};
+  AccessLogRing *access_log{nullptr};
 };
 
-class Worker {
+template <class RingT, class BufferRingT> class BasicWorker {
 public:
-  explicit Worker(WorkerInit init);
-  ~Worker();
-  Worker(const Worker &) = delete;
-  Worker &operator=(const Worker &) = delete;
+  explicit BasicWorker(WorkerInit init);
+  ~BasicWorker();
+  BasicWorker(const BasicWorker &) = delete;
+  BasicWorker &operator=(const BasicWorker &) = delete;
 
   // Pin -> ring -> buffer ring -> pools. Must run on the worker thread.
   [[nodiscard]] std::expected<void, std::string> init();
@@ -52,6 +54,9 @@ public:
   void run();
 
 private:
+  friend class WorkerRingTest;
+  void run_once();
+
   enum class Phase : uint8_t { Running, Draining, Stopping };
 
   struct ListenerSlot {
@@ -89,10 +94,11 @@ private:
   [[nodiscard]] Handle find_listener(ListenerId id);
 
   WorkerInit init_;
-  std::unique_ptr<Ring> ring_;
-  std::unique_ptr<BufferRing> buffers_;
+  std::unique_ptr<RingT> ring_;
+  std::unique_ptr<BufferRingT> buffers_;
   std::unique_ptr<TimerWheel> timers_;
   std::shared_ptr<const ConfigSnapshot> snapshot_;
+  std::shared_ptr<const StaticRoots> static_roots_;
   std::unique_ptr<IoContext> ctx_;
   // l4 / http1 services. Declared BEFORE connections_ and destroyed AFTER it: a
   // connection's destructor returns its chunks / backend accounting / detaches
@@ -101,7 +107,9 @@ private:
   // both chunk pools (its streams return chunks).
   ChunkPool chunks_;
   ChunkPool stage_;
+  std::unique_ptr<char[]> route_scratch_;
   std::unique_ptr<UpstreamPool> upstreams_;
+  IdleUpstreams idle_upstreams_;
   std::unique_ptr<ExchangePool> exchanges_;
   std::unique_ptr<HandlePool<ListenerSlot>> listeners_;
   std::unique_ptr<ConnPools> connections_;
@@ -115,5 +123,8 @@ private:
   TimePoint drain_deadline_{};
   bool initialized_{false};
 };
+
+// Match the build-target seam used by IoContext and the protocol pools.
+using Worker = BasicWorker<IoRing, IoBufferRing>;
 
 } // namespace Coring5

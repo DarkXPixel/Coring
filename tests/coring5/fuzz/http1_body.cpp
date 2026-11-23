@@ -3,6 +3,7 @@
 // ContentLengthFramer must never take more than declared or available.
 #include "coring5/proto/http1/BodyFraming.hpp"
 #include "coring5/proto/http1/ChunkedDecoder.hpp"
+#include <array>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -20,12 +21,15 @@ struct Verdict {
   Errc error{Errc::Ok};
   std::size_t consumed{0};
   std::string body;
+  std::string trailers;
   bool operator==(const Verdict &) const = default;
 };
 
 Verdict run(const char *buf, std::size_t size, std::size_t step,
             std::size_t max_data) {
   ChunkedDecoder dec;
+  std::array<char, Limits{}.max_head_bytes> capture;
+  dec.capture_trailers(capture);
   Verdict v;
   std::size_t pos = 0;
   std::size_t arrived = step < size ? step : size;
@@ -60,14 +64,21 @@ Verdict run(const char *buf, std::size_t size, std::size_t step,
       }
       arrived = (size - arrived) < step ? size : arrived + step;
       break;
-    case ChunkedEvent::Done:
+    case ChunkedEvent::Done: {
       if (!dec.done() || dec.on_eof() != Errc::Ok ||
           dec.body_bytes() != v.body.size()) {
         std::abort();
       }
       v.outcome = Outcome::Done;
       v.consumed = pos;
+      const auto trailers = dec.trailer_block();
+      if (trailers.size() < 2 || trailers.size() > pos ||
+          std::memcmp(trailers.data(), buf + pos - trailers.size(), trailers.size()) != 0) {
+        std::abort();
+      }
+      v.trailers.assign(trailers.begin(), trailers.end());
       return v;
+    }
     case ChunkedEvent::Error:
       if (!dec.failed() || s.error == Errc::Ok ||
           s.reason == ChunkedReason::None) {
@@ -123,9 +134,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
   const std::size_t n = size - 2;
   const Verdict whole = run(p, n, n, static_cast<std::size_t>(-1));
   const Verdict split = run(p, n, step, credit);
-  if (whole.outcome != split.outcome || whole.reason != split.reason ||
-      whole.error != split.error || whole.consumed != split.consumed ||
-      whole.body != split.body) {
+  if (whole != split) {
     std::abort();
   }
   return 0;

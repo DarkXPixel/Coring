@@ -103,6 +103,15 @@ WriteStatus BodyStream::finish(bool has_trailers) noexcept {
   return WriteStatus::Ok;
 }
 
+bool BodyStream::begin_tunnel() noexcept {
+  if (state_ != StreamState::Finished || pushed_ != 0 || declared_set_ ||
+      has_trailers_) {
+    return false;
+  }
+  state_ = StreamState::Open;
+  return true;
+}
+
 bool BodyStream::set_declared(uint64_t total) noexcept {
   if (state_ != StreamState::Open || declared_set_ || pushed_ > total) {
     return false;

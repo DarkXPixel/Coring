@@ -1,28 +1,27 @@
-# Coring5 example configuration. See docs/CONFIG_AND_RELOAD.md.
-#
-# [runtime]  fixed for the process lifetime: changing it needs a restart
-#            (a reload that touches it is rejected, the old config keeps running).
-# [limits] and [[listener]]  are hot-reloadable (SIGHUP or `coringctl reload`).
+# Coring5 HTTP/1 reverse proxy for a local HTTP backend.
+# Validate with: coringd --config deploy/coring.example.toml --check-config
 
+# Runtime settings size each worker at startup and require a restart to change.
 [runtime]
-workers = 2 # one thread (and one io_uring) per worker
-# cpus = [2, 3]                   # pin worker i to cpus[i]; omit to not pin
-max_connections_per_worker = 10000 # budget shared by all connection pools
-
-# Optional explicit per-worker pool sizes (0/absent = derive from the listeners'
-# `max_connections`, then share what is left of the budget above). Pools are
-# sized at startup; a reload whose listeners do not fit is rejected.
-# [runtime.pools]
-# echo = 0
-# l4 = 4000
-# http1 = 6000
-buffer_count = 1024          # power of two; provided-buffer ring entries
+workers = 2
+max_connections_per_worker = 10000
+buffer_count = 1024
 buffer_size = 16384
-ring_sq_entries = 2048       # powers of two, cq >= sq
+ring_sq_entries = 2048
 ring_cq_entries = 8192
-tick_ms = 50                 # timer wheel resolution
-drain_timeout_ms = 10000     # graceful shutdown deadline
+tick_ms = 50
+drain_timeout_ms = 10000
 reload_ack_timeout_ms = 5000
+# cpus = [0, 1]                  # optional pinning, one CPU per worker
+# relay_memory_mib = 256         # per worker for L4 and HTTP body chunks
+# http1_stage_bytes = 0          # auto: startup max_head_bytes + buffer_size
+
+# Optional HTTP/1 access log. Changes require a daemon restart.
+# The coringd service needs write access to the log directory.
+# [access_log]
+# path = "/var/log/coring/access.log" # parent directory must exist
+# rotate_bytes = 10485760             # set both rotation keys, or omit both
+# rotate_files = 5                    # 1..255 archives, .1 is newest
 
 [limits]
 idle_timeout_ms = 60000
@@ -34,33 +33,31 @@ max_headers = 100
 max_uri_bytes = 8192
 queue_high_watermark = 262144
 queue_low_watermark = 65536
+max_requests = 1000              # 0 = unlimited requests per HTTP connection
+max_request_body_bytes = 0       # 0 = unlimited request body size
 
-# protocol = "echo" is the reference implementation. "l4" is the TCP
-# passthrough proxy (needs `upstream`, see the example below). "http1" is an
-# operational stub (answers 501/400 and closes). "http2"/"http3" are rejected
-# by the validator until M8/M10.
-# `max_connections` (optional, per worker) sizes this listener's share of its
-# protocol's pool.
-# [[listener]]
-# name = "echo"
-# address = "127.0.0.1:8080"
-# protocol = "echo"
-# max_connections = 5000
-
-# L4 (TCP passthrough). `upstream` names a [[upstream]] below; backends are
-# numeric ip:port (no DNS on the data path). Relay memory per worker is bounded
-# by [runtime] relay_memory_mib (default 256), chunk size = buffer_size.
 [[listener]]
-name = "tcp"
+name = "http"
 address = "0.0.0.0:9000"
-protocol = "l4"
+protocol = "http1"
+route = "site"
+
+# The default virtual host and root prefix match every host and path.
+[[route_set]]
+name = "site"
+
+[[route_set.vhost]]
+default = true
+
+[[route_set.vhost.location]]
+path = "/"
+match = "prefix"
+action = "reverse_proxy"
 upstream = "backends"
-#
+
 [[upstream]]
 name = "backends"
-# backends = ["10.0.0.11:9000", "10.0.0.12:9000"]
 backends = ["127.0.0.1:8080"]
-policy = "round_robin"        # or "least_conn"
-connect_timeout_ms = 3000     # 0/absent = [limits] connect_timeout_ms
-max_fails = 3                 # consecutive connect failures before ejection; 0 = never
+policy = "round_robin"
+max_fails = 3
 eject_time_ms = 10000

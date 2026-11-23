@@ -165,16 +165,23 @@ Result<Respond> Respond::make(uint16_t status,
 
 Result<ApplyStatus> Respond::apply(Exchange &ex,
                                    ApplyCursor &cur) const noexcept {
+  return apply(ex, cur, status_, body_);
+}
+
+Result<ApplyStatus>
+Respond::apply(Exchange &ex, ApplyCursor &cur, uint16_t status,
+               std::string_view body,
+               std::span<const ResponseField> fields) noexcept {
   if (!cur.head_done) {
     if (ex.phase() == Phase::Routing && !ex.attach_responder(SideRef{})) {
       return std::unexpected(err(Errc::Canceled));
     }
     ResponseMeta m;
-    m.status = status_;
-    m.no_content = content_forbidden(status_, ex.request_meta().head_only);
-    m.declared_known = !m.no_content;
-    m.declared = m.no_content ? 0 : body_.size();
-    if (ex.publish_final(m) != HeadStatus::Ok) {
+    m.status = status;
+    m.no_content = content_forbidden(status, ex.request_meta().head_only);
+    m.declared_known = !content_forbidden(status, false);
+    m.declared = body.size();
+    if (ex.publish_final(m, fields) != HeadStatus::Ok) {
       return std::unexpected(err(Errc::Canceled));
     }
     cur.head_done = true;
@@ -182,9 +189,9 @@ Result<ApplyStatus> Respond::apply(Exchange &ex,
       return ApplyStatus::Done; // publish_final finished the stream
     }
   }
-  while (cur.sent < body_.size()) {
+  while (cur.sent < body.size()) {
     const auto want = static_cast<uint32_t>(
-        std::min<uint64_t>(body_.size() - cur.sent, UINT32_MAX));
+        std::min<uint64_t>(body.size() - cur.sent, UINT32_MAX));
     const ClaimResult c = ex.claim(StreamId::Res, want);
     if (c.status == ClaimStatus::Blocked) {
       return ApplyStatus::Blocked;
@@ -193,7 +200,7 @@ Result<ApplyStatus> Respond::apply(Exchange &ex,
       return std::unexpected(err(Errc::Canceled));
     }
     const auto *p =
-        reinterpret_cast<const std::byte *>(body_.data()) + cur.sent;
+        reinterpret_cast<const std::byte *>(body.data()) + cur.sent;
     if (ex.push(StreamId::Res, std::span<const std::byte>(p, c.granted)) !=
         WriteStatus::Ok) {
       return std::unexpected(err(Errc::Canceled));
@@ -259,7 +266,7 @@ Result<std::span<const ProxyHeader>>
 ReverseProxy::on_response_head(Exchange &ex, ApplyCursor &cur,
                                ResponseMeta meta,
                                std::span<const ProxyHeader> input,
-                               std::span<ProxyHeader> output) noexcept {
+                               std::span<ProxyHeader> output, bool tunnel) noexcept {
   if (cur.head_done || ex.phase() != Phase::Active ||
       ex.responder_state() != Exchange::ResponderState::Attached) {
     return unexpected_error(Errc::Canceled);
@@ -269,25 +276,30 @@ ReverseProxy::on_response_head(Exchange &ex, ApplyCursor &cur,
     return unexpected_error(Errc::Canceled);
   }
   const auto filtered = filter_headers(input, output, false);
-  if (!filtered || meta.status < 200 || meta.status > 599) {
+  const bool status_valid = tunnel ? meta.status == 101
+                                   : meta.status >= 200 && meta.status <= 599;
+  if (!filtered || !status_valid) {
     const Errc why = filtered ? Errc::ProtocolViolation : filtered.error().code;
     (void)on_failure(ex, why, ProxyRetry::Disallow);
     return unexpected_error(why);
   }
   meta.synthesized = false;
-  if (ex.publish_final(meta) != HeadStatus::Ok) {
+  const auto fields = output.first(*filtered);
+  const auto head = tunnel ? ex.publish_tunnel(fields)
+                           : ex.publish_final(meta, fields);
+  if (head != HeadStatus::Ok) {
     return unexpected_error(Errc::Canceled);
   }
   cur.head_done = true;
-  if (meta.declared_known && meta.declared == 0 &&
+  if (!tunnel && meta.declared_known && meta.declared == 0 &&
       ex.stream(StreamId::Res).state() == StreamState::Open) {
     (void)ex.finish(StreamId::Res);
   }
   request_staged_ = 0;
-  if (!ex.stream(StreamId::Req).end_seen()) {
+  if (!tunnel && !ex.stream(StreamId::Req).end_seen()) {
     (void)ex.cancel_request_body();
   }
-  return output.first(*filtered);
+  return fields;
 }
 
 } // namespace Coring5

@@ -114,6 +114,12 @@ public:
     timer_.pool = self_.pool;
     ctx.timers.schedule(timer_, ctx.now + after);
   }
+  bool counted_file_lookup(bool queued, OpKind kind) noexcept {
+    if (queued) {
+      lookup_ = kind;
+    }
+    return counted(queued);
+  }
   void cancel_timer() noexcept { timer_.cancel(); }
 
 private:
@@ -123,6 +129,7 @@ private:
 
   FdOwner fd_;
   FdOwner peer_;
+  OpKind lookup_{OpKind::Nop};
   TimerNode timer_;
   ConnRef self_{};
   State state_{State::Active};

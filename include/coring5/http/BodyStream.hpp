@@ -168,6 +168,10 @@ public:
   [[nodiscard]] uint32_t low() const noexcept { return low_; }
 
 private:
+  friend class Exchange;
+  // The HTTP handshake used no request body. A negotiated tunnel starts a
+  // fresh unframed stream with the same credit limits.
+  [[nodiscard]] bool begin_tunnel() noexcept;
   void abort_with(Errc why) noexcept;
   void wake_writer() noexcept;
   void wake_reader() noexcept;

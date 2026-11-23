@@ -24,6 +24,8 @@ enum class DeadlineKind : uint8_t {
   BodyIdle,
   UpstreamConnect,
   UpstreamFirstByte,
+  UpstreamRead,
+  UpstreamWrite,
   WriteStall,
   KeepAlive,
   MaxLifetime,

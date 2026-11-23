@@ -1,6 +1,8 @@
 #include "coring5/runtime/Worker.hpp"
+#include "coring5/http/Handlers.hpp"
 #include "coring5/runtime/ExchangeDelivery.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <csignal>
 #include <format>
@@ -15,10 +17,17 @@ constexpr uint32_t kMaxListenersPerWorker = 1024;
 constexpr Millis kHardStopGrace{5000}; // after the drain deadline
 
 bool pin_to_cpu(int cpu) {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  CPU_SET(static_cast<std::size_t>(cpu), &set);
-  return ::pthread_setaffinity_np(::pthread_self(), sizeof(set), &set) == 0;
+  constexpr std::size_t cpu_limit = 4096; // same as the config CPU ID limit
+  const auto size = CPU_ALLOC_SIZE(cpu_limit);
+  auto *set = CPU_ALLOC(cpu_limit);
+  if (!set) {
+    return false;
+  }
+  CPU_ZERO_S(size, set);
+  CPU_SET_S(static_cast<std::size_t>(cpu), size, set);
+  const bool pinned = ::pthread_setaffinity_np(::pthread_self(), size, set) == 0;
+  CPU_FREE(set);
+  return pinned;
 }
 
 void block_all_signals() {
@@ -36,9 +45,12 @@ __kernel_timespec to_timespec(Millis ms) {
 
 } // namespace
 
-Worker::Worker(WorkerInit init) : init_(std::move(init)) {}
+template <class RingT, class BufferRingT>
+BasicWorker<RingT, BufferRingT>::BasicWorker(WorkerInit init)
+    : init_(std::move(init)) {}
 
-Worker::~Worker() {
+template <class RingT, class BufferRingT>
+BasicWorker<RingT, BufferRingT>::~BasicWorker() {
   // Explicit order: connections (fds, timer nodes) first, ring last.
   connections_.reset();
   listeners_.reset();
@@ -52,7 +64,8 @@ Worker::~Worker() {
   ring_.reset();
 }
 
-std::expected<void, std::string> Worker::init() {
+template <class RingT, class BufferRingT>
+std::expected<void, std::string> BasicWorker<RingT, BufferRingT>::init() {
   if (init_.mailbox == nullptr || init_.metrics == nullptr ||
       !init_.mailbox->valid()) {
     return std::unexpected("worker: mailbox/metrics not provided");
@@ -68,7 +81,7 @@ std::expected<void, std::string> Worker::init() {
   RingConfig rc;
   rc.sq_entries = init_.runtime.ring_sq_entries;
   rc.cq_entries = init_.runtime.ring_cq_entries;
-  auto ring = Ring::create(rc);
+  auto ring = RingT::create(rc);
   if (!ring) {
     return std::unexpected(std::format(
         "worker {}: io_uring setup failed ({}, errno {}). Blocked by seccomp "
@@ -78,14 +91,14 @@ std::expected<void, std::string> Worker::init() {
   }
   ring_ = std::move(*ring);
 
-  auto bufs = BufferRing::create(*ring_, 0, init_.runtime.buffer_count,
+  auto bufs = BufferRingT::create(*ring_, 0, init_.runtime.buffer_count,
                                  init_.runtime.buffer_size);
   if (!bufs) {
     return std::unexpected(std::format(
         "worker {}: buffer ring failed ({}, errno {})", init_.id.value,
         to_string(bufs.error().code), bufs.error().sys));
   }
-  buffers_ = std::make_unique<BufferRing>(std::move(*bufs));
+  buffers_ = std::make_unique<BufferRingT>(std::move(*bufs));
 
   timers_ = std::make_unique<TimerWheel>(
       Clock::now(), std::chrono::duration_cast<Nanos>(init_.runtime.tick),
@@ -100,6 +113,7 @@ std::expected<void, std::string> Worker::init() {
                                                &snapshot_->limits,
                                                Clock::now(),
                                                {}});
+  ctx_->access_log = init_.access_log;
 
   // Chunk memory (chunk = buffer_size): one lazily-faulted slab per worker,
   // only when an l4 or http1 pool exists. Serves l4 relay queues and HTTP/1
@@ -119,19 +133,25 @@ std::expected<void, std::string> Worker::init() {
     }
     chunks_ = std::move(*cp);
   }
-  // HTTP/1: one stage chunk per connection (sessions allocate lazily; the slab
-  // is mapped noreserve) and one Exchange per connection (serial sessions).
+  // HTTP/1: two stages per side, plus egress response trailers, allocated
+  // lazily from a noreserve slab. Output must fit the longest valid Location
+  // plus its status line and framing even with a small request-head limit.
   if (http1_cap > 0) {
     const uint32_t stage_bytes = init_.runtime.http1_stage_effective != 0
                                      ? init_.runtime.http1_stage_effective
                                      : init_.runtime.buffer_size;
-    auto sp = ChunkPool::create(stage_bytes, http1_cap);
+    constexpr uint32_t min_response_stage = kMaxLocationBytes + 128;
+    auto sp = ChunkPool::create(std::max(stage_bytes, min_response_stage),
+                               5 * http1_cap);
     if (!sp) {
       return std::unexpected(std::format(
           "worker {}: http1 stage pool failed ({}, errno {})", init_.id.value,
           to_string(sp.error().code), sp.error().sys));
     }
     stage_ = std::move(*sp);
+    route_scratch_ = std::make_unique_for_overwrite<char[]>(stage_bytes);
+    ctx_->route_scratch = {route_scratch_.get(), stage_bytes};
+    ctx_->idle_upstreams = &idle_upstreams_;
   }
   exchanges_ = std::make_unique<ExchangePool>(
       http1_cap, chunks_, StreamLimits::from(snapshot_->limits));
@@ -139,6 +159,7 @@ std::expected<void, std::string> Worker::init() {
   ctx_->chunks = &chunks_;
   ctx_->exchanges = exchanges_.get();
   ctx_->stage = &stage_;
+  ctx_->snapshot = snapshot_.get();
 
   listeners_ =
       std::make_unique<HandlePool<ListenerSlot>>(kMaxListenersPerWorker);
@@ -159,79 +180,88 @@ std::expected<void, std::string> Worker::init() {
   return {};
 }
 
-void Worker::arm_mailbox() {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::arm_mailbox() {
   mailbox_armed_ = ring_->poll_multishot(init_.mailbox->event_fd(),
                                          OpTag::make(OpKind::Mailbox, 0, 0));
 }
 
-void Worker::arm_tick() {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::arm_tick() {
   // If the SQ is full this stays false and run() retries on the next iteration;
   // the worker never terminates because of SQ exhaustion (invariant I7).
   tick_armed_ = ring_->timeout(&tick_ts_, OpTag::make(OpKind::Tick, 0, 0));
 }
 
-void Worker::run() {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::run() {
   if (!initialized_) {
     return;
   }
   while (!done_) {
-    // Ready exchanges mean there is work that no CQE will announce: never
-    // sleep in the kernel then (submit without waiting).
-    auto r = exchanges_->has_ready() ? ring_->submit_nowait()
-                                     : ring_->submit_and_wait(1);
-    if (!r) {
-      const int err = r.error().sys;
-      if (err != EINTR && err != EBUSY && err != EAGAIN) {
-        std::terminate(); // unrecoverable ring failure: supervisor restarts us
-      }
-      // Retryable: do NOT skip the rest of the iteration. EBUSY means the
-      // kernel could not flush CQ-overflow entries or accept more work until
-      // the application reaps; skipping the reap below would livelock. Timers
-      // and housekeeping must also keep running after EINTR. Unsubmitted SQEs
-      // stay queued and go out with the next submit.
-      ring_->flush_events(); // make overflowed CQEs visible to the reap below
-    }
-
-    const auto t0 = Clock::now();
-    ctx_->now = t0;
-
-    const unsigned n = ring_->reap([this](const Cqe &c) { dispatch(c); });
-    inc(init_.metrics->cqes, n);
-
-    timers_->advance(t0, [this](TimerNode &node) {
-      if (!connections_->on_timer(*ctx_, node.pool, node.owner, node.kind)) {
-        inc(init_.metrics->stale_events); // would mean a leaked TimerNode
-      }
-    });
-
-    drain_exchanges(); // before reap_closed(): may close connections
-
-    if (!tick_armed_) {
-      arm_tick();
-    }
-    if (!mailbox_armed_) {
-      arm_mailbox();
-    }
-    reap_closed();
-    buffers_->publish(); // one tail store per iteration
-    check_shutdown_progress();
-
-    inc(init_.metrics->loop_iterations);
-    set(init_.metrics->buffers_free, buffers_->free_count());
-    set(init_.metrics->relay_chunks_in_use, chunks_.in_use());
-    set(init_.metrics->relay_chunks_peak, chunks_.peak_in_use());
-    set(init_.metrics->sq_full, ring_->sq_full_events());
-    if (ring_->cq_overflowed()) {
-      inc(init_.metrics->cq_overflow);
-    }
-    init_.metrics->loop_ns.record(static_cast<uint64_t>(
-        std::chrono::duration_cast<Nanos>(Clock::now() - t0).count()));
+    run_once();
   }
+}
+
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::run_once() {
+  // Ready exchanges mean there is work that no CQE will announce: never
+  // sleep in the kernel then (submit without waiting).
+  auto r = exchanges_->has_ready() ? ring_->submit_nowait()
+                                   : ring_->submit_and_wait(1);
+  if (!r) {
+    const int err = r.error().sys;
+    if (err != EINTR && err != EBUSY && err != EAGAIN) {
+      std::terminate(); // unrecoverable ring failure: supervisor restarts us
+    }
+    // Retryable: do NOT skip the rest of the iteration. EBUSY means the
+    // kernel could not flush CQ-overflow entries or accept more work until
+    // the application reaps; skipping the reap below would livelock. Timers
+    // and housekeeping must also keep running after EINTR. Unsubmitted SQEs
+    // stay queued and go out with the next submit.
+    ring_->flush_events(); // make overflowed CQEs visible to the reap below
+  }
+
+  const auto t0 = Clock::now();
+  ctx_->now = t0;
+
+  const unsigned n = ring_->reap([this](const Cqe &c) { dispatch(c); });
+  inc(init_.metrics->cqes, n);
+
+  timers_->advance(t0, [this](TimerNode &node) {
+    if (!connections_->on_timer(*ctx_, node.pool, node.owner, node.kind)) {
+      inc(init_.metrics->stale_events); // would mean a leaked TimerNode
+    }
+  });
+
+  drain_exchanges(); // before reap_closed(): may close connections
+
+  if (!tick_armed_) {
+    arm_tick();
+  }
+  if (!mailbox_armed_) {
+    arm_mailbox();
+  }
+  reap_closed();
+  buffers_->publish(); // one tail store per iteration
+  check_shutdown_progress();
+
+  inc(init_.metrics->loop_iterations);
+  set(init_.metrics->buffers_free, buffers_->free_count());
+  set(init_.metrics->relay_chunks_in_use, chunks_.in_use());
+  set(init_.metrics->relay_chunks_peak, chunks_.peak_in_use());
+  set(init_.metrics->sq_full, ring_->sq_full_events());
+  if (ring_->cq_overflowed()) {
+    inc(init_.metrics->cq_overflow);
+  }
+  init_.metrics->loop_ns.record(static_cast<uint64_t>(
+      std::chrono::duration_cast<Nanos>(Clock::now() - t0).count()));
 }
 
 // ---------------------------------------------------------------- dispatch
 
-void Worker::dispatch(const Cqe &cqe) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::dispatch(const Cqe &cqe) {
   switch (cqe.tag.kind()) {
   case OpKind::Accept:
     on_accept(cqe);
@@ -256,9 +286,10 @@ void Worker::dispatch(const Cqe &cqe) {
   }
 }
 
-void Worker::on_connection_cqe(const Cqe &cqe) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::on_connection_cqe(const Cqe &cqe) {
   // The Lease recycles the provided buffer on every path out of this function.
-  BufferRing::Lease lease;
+  typename BufferRingT::Lease lease;
   if (cqe.has_buffer()) {
     lease = buffers_->take(cqe.buffer_id(),
                            cqe.res > 0 ? static_cast<uint32_t>(cqe.res) : 0U);
@@ -268,7 +299,8 @@ void Worker::on_connection_cqe(const Cqe &cqe) {
   }
 }
 
-void Worker::on_accept(const Cqe &cqe) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::on_accept(const Cqe &cqe) {
   const Handle lh = cqe.tag.handle();
   ListenerSlot *slot = listeners_->get(lh);
   if (slot == nullptr) [[unlikely]] {
@@ -312,7 +344,8 @@ void Worker::on_accept(const Cqe &cqe) {
   }
 }
 
-void Worker::on_listener_cancel(const Cqe &cqe) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::on_listener_cancel(const Cqe &cqe) {
   const Handle lh = cqe.tag.handle();
   ListenerSlot *slot = listeners_->get(lh);
   if (slot == nullptr) [[unlikely]] {
@@ -323,7 +356,8 @@ void Worker::on_listener_cancel(const Cqe &cqe) {
   maybe_free_listener(lh, *slot);
 }
 
-void Worker::on_mailbox(const Cqe &cqe) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::on_mailbox(const Cqe &cqe) {
   if (cqe.res >= 0) {
     inbox_.clear();
     init_.mailbox->drain(inbox_);
@@ -342,8 +376,12 @@ void Worker::on_mailbox(const Cqe &cqe) {
   }
 }
 
-void Worker::on_tick() {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::on_tick() {
   tick_armed_ = false;
+  if (ctx_->idle_upstreams) {
+    idle_upstreams_.expire(*upstreams_, ctx_->now);
+  }
   // Retry listeners whose accept ended on an error (-EMFILE etc.).
   listeners_->for_each([this](Handle h, ListenerSlot &s) {
     if (s.rearm && !s.removing && phase_ == Phase::Running) {
@@ -356,14 +394,18 @@ void Worker::on_tick() {
 
 // ----------------------------------------------------------------- control
 
-void Worker::apply(ApplyConfig &msg) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::apply(ApplyConfig &msg) {
   bool ok = (phase_ == Phase::Running);
   if (ok) {
     snapshot_ = msg.snapshot; // drops our ref to the old snapshot
     ctx_->limits = &snapshot_->limits;
+    ctx_->snapshot = snapshot_.get();
+    static_roots_ = std::move(msg.roots);
+    ctx_->static_roots = static_roots_.get();
     exchanges_->set_limits(StreamLimits::from(snapshot_->limits));
-    upstreams_->apply_config(
-        *snapshot_); // copies: no pointer into the snapshot
+    upstreams_->install(msg.upstreams);
+    idle_upstreams_.expire(*upstreams_, ctx_->now);
     set(init_.metrics->config_generation, snapshot_->generation);
 
     for (auto &id : msg.remove) {
@@ -373,7 +415,7 @@ void Worker::apply(ApplyConfig &msg) {
     }
     for (auto &lf : msg.add) {
       auto [h, slot] =
-          listeners_->create<ListenerSlot>(lf.id, std::move(lf.fd));
+          listeners_->template create<ListenerSlot>(lf.id, std::move(lf.fd));
       if (slot == nullptr) {
         ok = false;
         continue;
@@ -387,11 +429,13 @@ void Worker::apply(ApplyConfig &msg) {
   }
 }
 
-void Worker::begin_shutdown(const Shutdown &msg) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::begin_shutdown(const Shutdown &msg) {
   if (phase_ != Phase::Running) {
     return;
   }
   phase_ = Phase::Draining;
+  idle_upstreams_.stop();
   drain_deadline_ = ctx_->now + msg.drain_timeout;
   listeners_->for_each(
       [this](Handle h, ListenerSlot &s) { remove_listener(h, s); });
@@ -400,7 +444,8 @@ void Worker::begin_shutdown(const Shutdown &msg) {
 
 // ----------------------------------------------------------------- helpers
 
-Handle Worker::find_listener(ListenerId id) {
+template <class RingT, class BufferRingT>
+Handle BasicWorker<RingT, BufferRingT>::find_listener(ListenerId id) {
   Handle found{};
   listeners_->for_each([&](Handle h, ListenerSlot &s) {
     if (s.id == id) {
@@ -410,7 +455,8 @@ Handle Worker::find_listener(ListenerId id) {
   return found;
 }
 
-void Worker::arm_accept(Handle h, ListenerSlot &slot) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::arm_accept(Handle h, ListenerSlot &slot) {
   if (ring_->accept_multishot(slot.fd.get(), OpTag::make(OpKind::Accept, h))) {
     slot.accept_armed = true;
     ++slot.pending_ops;
@@ -419,7 +465,9 @@ void Worker::arm_accept(Handle h, ListenerSlot &slot) {
   }
 }
 
-void Worker::remove_listener(Handle h, ListenerSlot &slot) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::remove_listener(Handle h,
+                                                      ListenerSlot &slot) {
   if (slot.removing) {
     return;
   }
@@ -437,13 +485,16 @@ void Worker::remove_listener(Handle h, ListenerSlot &slot) {
   maybe_free_listener(h, slot);
 }
 
-void Worker::maybe_free_listener(Handle h, ListenerSlot &slot) {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::maybe_free_listener(Handle h,
+                                                          ListenerSlot &slot) {
   if (slot.removing && slot.pending_ops == 0) {
     listeners_->destroy(h); // FdOwner closes the listening socket here
   }
 }
 
-void Worker::drain_exchanges() {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::drain_exchanges() {
   // Bounded per iteration so a busy pool cannot starve the ring; leftovers keep
   // has_ready() true and the next submit does not block.
   constexpr uint32_t kBudget = 1024;
@@ -454,7 +505,8 @@ void Worker::drain_exchanges() {
   });
 }
 
-void Worker::reap_closed() {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::reap_closed() {
   if (ctx_->closed.empty()) {
     return;
   }
@@ -465,7 +517,8 @@ void Worker::reap_closed() {
   publish_pool_gauges();
 }
 
-void Worker::publish_pool_gauges() {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::publish_pool_gauges() {
   for (std::size_t p = 0; p < kPoolCount; ++p) {
     set(init_.metrics->pool_live[p],
         connections_->live(static_cast<PoolId>(p)));
@@ -474,7 +527,8 @@ void Worker::publish_pool_gauges() {
   set(init_.metrics->conns_live, connections_->live());
 }
 
-void Worker::check_shutdown_progress() {
+template <class RingT, class BufferRingT>
+void BasicWorker<RingT, BufferRingT>::check_shutdown_progress() {
   if (phase_ == Phase::Running) {
     return;
   }
@@ -491,5 +545,7 @@ void Worker::check_shutdown_progress() {
     done_ = true; // cancels did not complete in time: leave it to ring teardown
   }
 }
+
+template class BasicWorker<IoRing, IoBufferRing>;
 
 } // namespace Coring5
